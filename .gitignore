@@ -1,0 +1,23 @@
+# Node
+node_modules/
+.next/
+
+# Rust
+**/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+**/docker-data/
+
+# Large build artifacts
+**/*.bin
+**/*.wasm
+**/snapshots/RARI_SNAPSHOT.bin

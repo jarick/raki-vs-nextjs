@@ -1,0 +1,9 @@
+{
+  "extends": "../.config/typescript/app.json",
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src"]
+}

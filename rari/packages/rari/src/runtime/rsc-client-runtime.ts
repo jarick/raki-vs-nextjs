@@ -1,0 +1,1922 @@
+import type { GlobalWithRari, ModuleData, WindowWithRari } from './shared/types'
+import * as React from 'react'
+import { cloneElement, createElement, isValidElement, Suspense, use, useEffect, useState } from 'react'
+import * as ReactDOMClient from 'react-dom/client'
+import {
+  CAMEL_CASE_REGEX,
+  EXTENSION_REGEX,
+  HTML_AMPERSAND_REGEX,
+  HTML_APOS_REGEX,
+  HTML_GT_REGEX,
+  HTML_LT_REGEX,
+  HTML_QUOTE_REGEX,
+  NEWLINE_REGEX,
+} from '../shared/regex-constants'
+import { getClientComponent as getClientComponentShared } from './shared/get-client-component'
+import { createFromFetch as rariCreateFromFetch, createFromReadableStream as rariCreateFromReadableStream } from './vendor/react-flight-client'
+
+function resolveRariServerUrl(): string {
+  if (typeof import.meta !== 'undefined' && import.meta.env?.RARI_SERVER_URL)
+    return import.meta.env.RARI_SERVER_URL
+  if (typeof window !== 'undefined')
+    return window.location.origin
+
+  return 'http://localhost:3000'
+}
+
+if (typeof (globalThis as unknown as GlobalWithRari)['~rari'] === 'undefined')
+  (globalThis as unknown as GlobalWithRari)['~rari'] = {}
+
+// eslint-disable-next-line node/prefer-global/process
+; (globalThis as unknown as GlobalWithRari)['~rari'].isDevelopment = process.env.NODE_ENV !== 'production'
+
+if (typeof (globalThis as unknown as GlobalWithRari)['~clientComponents'] === 'undefined')
+  (globalThis as unknown as GlobalWithRari)['~clientComponents'] = {}
+if (typeof (globalThis as unknown as GlobalWithRari)['~clientComponentNames'] === 'undefined')
+  (globalThis as unknown as GlobalWithRari)['~clientComponentNames'] = {}
+if (typeof (globalThis as unknown as GlobalWithRari)['~clientComponentPaths'] === 'undefined')
+  (globalThis as unknown as GlobalWithRari)['~clientComponentPaths'] = {}
+
+if (typeof window !== 'undefined') {
+  if (!(window as unknown as WindowWithRari)['~rari'])
+    (window as unknown as WindowWithRari)['~rari'] = (globalThis as unknown as GlobalWithRari)['~rari']
+
+  if (!(window as unknown as WindowWithRari)['~rari'].streaming)
+    (window as unknown as WindowWithRari)['~rari'].streaming = { bufferedRows: [], bufferedEvents: [] }
+
+  if (!(window as unknown as WindowWithRari)['~rari'].streaming!.bufferedEvents)
+    (window as unknown as WindowWithRari)['~rari'].streaming!.bufferedEvents = []
+
+  if (!(window as unknown as WindowWithRari)['~rari'].boundaryModules)
+    (window as unknown as WindowWithRari)['~rari'].boundaryModules = new Map()
+
+  if (!(window as unknown as WindowWithRari)['~rari'].pendingBoundaryHydrations)
+    (window as unknown as WindowWithRari)['~rari'].pendingBoundaryHydrations = new Map()
+}
+
+interface ParsedImportRow {
+  id: string
+  chunks: string[]
+  name: string
+}
+
+function parseImportRow(content: string): ParsedImportRow | null {
+  if (!content.startsWith('I{'))
+    return null
+
+  try {
+    const importData = JSON.parse(content.substring(1))
+    if (typeof importData === 'object' && importData !== null && !Array.isArray(importData)) {
+      if (typeof importData.id !== 'string') {
+        console.error('[rari] Invalid import data: id must be a string:', importData)
+        return null
+      }
+
+      let chunks: string[]
+      if (typeof importData.chunks === 'string') {
+        chunks = [importData.chunks]
+      }
+      else if (Array.isArray(importData.chunks)) {
+        chunks = importData.chunks.filter((chunk: any) => typeof chunk === 'string')
+      }
+      else {
+        console.error('[rari] Invalid import data: chunks must be a string or array:', importData)
+        return null
+      }
+
+      if (chunks.length === 0) {
+        console.error('[rari] Invalid import data: chunks array is empty:', importData)
+        return null
+      }
+
+      return {
+        id: importData.id,
+        chunks,
+        name: importData.name || 'default',
+      }
+    }
+    console.error('[rari] Invalid import data format, expected object:', importData)
+  }
+  catch (e) {
+    console.error('[rari] Failed to parse import row:', content, e)
+  }
+
+  return null
+}
+
+if (typeof window !== 'undefined') {
+  ; (globalThis as unknown as GlobalWithRari)['~rari'].processBoundaryUpdate = function (boundaryId: string, rscRow: string, rowId: string): void {
+    const boundaryElement = document.querySelector(`[data-boundary-id="${boundaryId}"]`)
+
+    if (!boundaryElement)
+      return
+
+    try {
+      const colonIndex = rscRow.indexOf(':')
+      if (colonIndex === -1) {
+        console.warn('[rari] Invalid RSC row format (no colon):', rscRow)
+        return
+      }
+
+      const actualRowId = rscRow.substring(0, colonIndex)
+      const contentStr = rscRow.substring(colonIndex + 1)
+
+      const importRow = parseImportRow(contentStr)
+      if (importRow) {
+        const moduleKey = `$L${actualRowId}`
+            ; (window as unknown as WindowWithRari)['~rari'].boundaryModules?.set(moduleKey, importRow)
+        return
+      }
+
+      let content
+      try {
+        content = JSON.parse(contentStr)
+      }
+      catch (parseError) {
+        console.error('[rari] Failed to parse RSC content:', contentStr, parseError)
+        return
+      }
+
+      function containsClientComponents(element: any): boolean {
+        if (!element)
+          return false
+
+        if (typeof element === 'string')
+          return element.startsWith('$L')
+
+        if (Array.isArray(element)) {
+          if (element.length >= 4 && element[0] === '$') {
+            const [, tag] = element
+            if (typeof tag === 'string' && tag.startsWith('$L'))
+              return true
+            const props = element[3]
+            if (props && props.children)
+              return containsClientComponents(props.children)
+          }
+
+          return element.some(child => containsClientComponents(child))
+        }
+
+        return false
+      }
+
+      if (containsClientComponents(content)) {
+        ; (window as unknown as WindowWithRari)['~rari'].pendingBoundaryHydrations?.set(boundaryId, {
+          content,
+          element: boundaryElement,
+          rowId,
+        })
+
+        if ((globalThis as unknown as GlobalWithRari)['~rari'].hydrateClientComponents) {
+          const hydrateFn = (globalThis as unknown as GlobalWithRari)['~rari'].hydrateClientComponents!
+          hydrateFn(boundaryId, content, boundaryElement)
+        }
+
+        return
+      }
+
+      function rscToHtml(element: any): string {
+        const escapeHtml = (value: string) =>
+          value
+            .replace(HTML_AMPERSAND_REGEX, '&amp;')
+            .replace(HTML_LT_REGEX, '&lt;')
+            .replace(HTML_GT_REGEX, '&gt;')
+            .replace(HTML_QUOTE_REGEX, '&quot;')
+            .replace(HTML_APOS_REGEX, '&#39;')
+
+        const ALLOWED_TAGS = new Set([
+          'div',
+          'span',
+          'p',
+          'ul',
+          'ol',
+          'li',
+          'a',
+          'img',
+          'section',
+          'article',
+          'header',
+          'footer',
+          'nav',
+          'main',
+          'aside',
+          'strong',
+          'em',
+          'b',
+          'i',
+          'button',
+          'input',
+          'label',
+          'form',
+          'select',
+          'option',
+          'textarea',
+          'h1',
+          'h2',
+          'h3',
+          'h4',
+          'h5',
+          'h6',
+          'table',
+          'thead',
+          'tbody',
+          'tr',
+          'td',
+          'th',
+          'code',
+          'pre',
+          'blockquote',
+          'hr',
+          'br',
+          'small',
+          'mark',
+          'del',
+          'ins',
+          'sub',
+          'sup',
+          'abbr',
+          'time',
+          'figure',
+          'figcaption',
+          'details',
+          'summary',
+          'dialog',
+          'menu',
+          'menuitem',
+          'canvas',
+          'svg',
+          'path',
+          'circle',
+          'rect',
+          'line',
+          'polygon',
+          'polyline',
+          'ellipse',
+          'text',
+          'g',
+          'defs',
+          'use',
+          'symbol',
+          'clippath',
+          'mask',
+          'pattern',
+          'lineargradient',
+          'radialgradient',
+          'stop',
+          'image',
+          'video',
+          'audio',
+          'source',
+          'track',
+          'picture',
+          'dl',
+          'dt',
+          'dd',
+          'fieldset',
+          'legend',
+        ])
+
+        if (!element)
+          return ''
+
+        if (typeof element === 'string' || typeof element === 'number')
+          return escapeHtml(String(element))
+
+        if (Array.isArray(element)) {
+          if (element.length >= 4 && element[0] === '$') {
+            const [, tag, , props] = element
+
+            const sanitizedTag = typeof tag === 'string' && ALLOWED_TAGS.has(tag.toLowerCase())
+              ? tag.toLowerCase()
+              : 'div'
+
+            let innerHTML = null
+            let children = ''
+
+            let attrs = ''
+            if (props) {
+              for (const [key, value] of Object.entries(props)) {
+                if (key === 'dangerouslySetInnerHTML' && value && typeof value === 'object' && '__html' in value) {
+                  innerHTML = value.__html
+                }
+                else if (key !== 'children' && key !== '~boundaryId') {
+                  const attrName = key === 'className' ? 'class' : key
+
+                  if (key === 'style' && typeof value === 'object' && value !== null) {
+                    const styleStr = Object.entries(value)
+                      .map(([k, v]) => {
+                        const kebabKey = k.replace(CAMEL_CASE_REGEX, '$1-$2').toLowerCase()
+                        return `${kebabKey}:${String(v)}`
+                      })
+                      .join(';')
+                    attrs += ` style="${escapeHtml(styleStr)}"`
+                  }
+                  else if (typeof value === 'string' || typeof value === 'number') {
+                    attrs += ` ${attrName}="${escapeHtml(String(value))}"`
+                  }
+                  else if (typeof value === 'boolean' && value) {
+                    attrs += ` ${attrName}`
+                  }
+                }
+              }
+
+              if (innerHTML === null && props.children)
+                children = rscToHtml(props.children)
+            }
+
+            return `<${sanitizedTag}${attrs}>${innerHTML !== null ? innerHTML : children}</${sanitizedTag}>`
+          }
+
+          return element.map(rscToHtml).join('')
+        }
+
+        return ''
+      }
+
+      const htmlContent = rscToHtml(content)
+
+      if (htmlContent) {
+        const isInDocument = document.contains(boundaryElement)
+
+        if (isInDocument) {
+          boundaryElement.innerHTML = htmlContent
+          boundaryElement.classList.add('rari-boundary-resolved')
+        }
+
+        window.dispatchEvent(new CustomEvent('rari:boundary-resolved', {
+          detail: {
+            boundaryId,
+            rscRow,
+            rowId,
+            element: boundaryElement,
+            wasAttached: isInDocument,
+          },
+        }))
+      }
+    }
+    catch (e) {
+      console.error('[rari] Error processing boundary update:', e)
+    }
+  }
+
+  const windowWithRari = window as unknown as WindowWithRari
+  const globalWithRari = globalThis as unknown as GlobalWithRari
+
+  if (windowWithRari['~rari'].streaming?.bufferedEvents && windowWithRari['~rari'].streaming!.bufferedEvents!.length > 0) {
+    windowWithRari['~rari'].streaming!.bufferedEvents!.forEach((event) => {
+      const { boundaryId, rscRow, rowId } = event
+      globalWithRari['~rari'].processBoundaryUpdate?.(boundaryId, rscRow, rowId)
+    })
+    windowWithRari['~rari'].streaming!.bufferedEvents = []
+  }
+
+  window.addEventListener('rari:boundary-update', (event) => {
+    const { boundaryId, rscRow, rowId } = (event as CustomEvent).detail
+    if (globalWithRari['~rari'].processBoundaryUpdate) {
+      globalWithRari['~rari'].processBoundaryUpdate!(boundaryId, rscRow, rowId)
+    }
+  })
+}
+
+export function registerClientComponent(componentFunction: any, id: string, exportName: string): void {
+  const componentName = exportName === 'default'
+    ? (componentFunction.name || id.split('/').pop()?.replace(EXTENSION_REGEX, '') || 'DefaultComponent')
+    : exportName
+
+  const componentId = componentName
+
+  const componentInfo = {
+    id: componentId,
+    path: id,
+    type: 'client',
+    component: componentFunction,
+    registered: true,
+  }
+
+  if (typeof (globalThis as unknown as GlobalWithRari)['~clientComponents'] === 'undefined') {
+    (globalThis as unknown as GlobalWithRari)['~clientComponents'] = {}
+  }
+
+  const fullId = `${id}#${exportName}`
+  ; (globalThis as unknown as GlobalWithRari)['~clientComponents'][componentId] = componentInfo
+  ; (globalThis as unknown as GlobalWithRari)['~clientComponents'][id] = componentInfo
+  ; (globalThis as unknown as GlobalWithRari)['~clientComponents'][fullId] = componentInfo
+
+  ; (globalThis as unknown as GlobalWithRari)['~clientComponentPaths'][id] = componentId
+
+  ; (globalThis as unknown as GlobalWithRari)['~clientComponentNames'][componentName] = componentId
+
+  if (componentFunction) {
+    componentFunction['~isClientComponent'] = true
+    componentFunction['~clientComponentId'] = componentId
+  }
+
+  if (typeof window !== 'undefined') {
+    fetch('/_rari/register-client', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        component_id: componentId,
+        file_path: id,
+        export_name: exportName,
+      }),
+    }).catch((error) => {
+      console.error('[rari] Failed to register client component with server:', error)
+    })
+  }
+}
+
+export function getClientComponent(id: string): any {
+  return getClientComponentShared(id)
+}
+
+export function createClientModuleMap(): Record<string, any> {
+  const moduleMap: Record<string, any> = {}
+  for (const [componentId, componentInfo] of Object.entries((globalThis as unknown as GlobalWithRari)['~clientComponents'])) {
+    moduleMap[componentId] = {
+      id: componentId,
+      chunks: [componentInfo.path],
+      name: componentId,
+      async: false,
+      default: componentInfo.component,
+    }
+  }
+
+  return moduleMap
+}
+
+let createFromFetch: typeof rariCreateFromFetch | null = rariCreateFromFetch
+let createFromReadableStream: typeof rariCreateFromReadableStream | null = rariCreateFromReadableStream
+let rscClientLoadPromise: Promise<any> | null = null
+
+async function loadRscClient(): Promise<any> {
+  if (rscClientLoadPromise)
+    return rscClientLoadPromise
+
+  rscClientLoadPromise = (async () => {
+    try {
+      createFromFetch = rariCreateFromFetch
+      createFromReadableStream = rariCreateFromReadableStream
+
+      if (typeof createFromReadableStream !== 'function')
+        createFromReadableStream = null
+      if (typeof createFromFetch !== 'function')
+        createFromFetch = null
+
+      return ReactDOMClient
+    }
+    catch (error) {
+      console.error('Failed to load react-dom/client RSC functions:', error)
+      createFromFetch = null
+      createFromReadableStream = null
+      return null
+    }
+  })()
+
+  return rscClientLoadPromise
+}
+
+const serverComponentCache = new Map<string, Promise<any>>()
+
+class RscClient {
+  componentCache: Map<string, any>
+  moduleCache: Map<string, any>
+  inflightRequests: Map<string, Promise<any>>
+  config: {
+    maxRetries: number
+    retryDelay: number
+    timeout: number
+  }
+
+  constructor() {
+    this.componentCache = new Map()
+    this.moduleCache = new Map()
+    this.inflightRequests = new Map()
+    this.config = {
+      maxRetries: 5,
+      retryDelay: 500,
+      timeout: 10000,
+    }
+  }
+
+  configure(config: Partial<RscClient['config']>): void {
+    this.config = { ...this.config, ...config }
+  }
+
+  clearCache(): void {
+    this.componentCache.clear()
+    this.moduleCache.clear()
+    serverComponentCache.clear()
+  }
+
+  async fetchServerComponent(componentId: string, props: any = {}): Promise<any> {
+    const hmrCounter = (typeof window !== 'undefined' && (window as unknown as WindowWithRari)['~rari']?.hmr?.refreshCounters?.[componentId]) || 0
+    const cacheKey = `${componentId}:${JSON.stringify(props)}:hmr:${hmrCounter}`
+
+    if (this.componentCache.has(cacheKey))
+      return this.componentCache.get(cacheKey)
+
+    if (this.inflightRequests.has(cacheKey))
+      return this.inflightRequests.get(cacheKey)
+
+    const requestPromise = this.fetchServerComponentStream(componentId, props)
+
+    this.inflightRequests.set(cacheKey, requestPromise)
+    try {
+      const result = await requestPromise
+      this.componentCache.set(cacheKey, result)
+      return result
+    }
+    finally {
+      this.inflightRequests.delete(cacheKey)
+    }
+  }
+
+  async fetchServerComponentStream(componentId: string, props: any = {}): Promise<any> {
+    await loadRscClient()
+
+    const endpoints = (() => {
+      const list = ['/_rari/stream']
+      try {
+        const isLocalHost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+        if (isLocalHost) {
+          const serverUrl = resolveRariServerUrl()
+          if (serverUrl)
+            list.push(`${serverUrl}/_rari/stream`)
+        }
+      }
+      catch { }
+
+      return list
+    })()
+    let response = null
+    let lastError = null
+    const attempt = async () => {
+      for (const url of endpoints) {
+        try {
+          const r = await this.fetchWithTimeout(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...this.buildRequestHeaders(),
+            },
+            body: JSON.stringify({ component_id: componentId, props }),
+          })
+          if (r.ok)
+            return r
+          lastError = new Error(`HTTP ${r.status}: ${await r.text()}`)
+        }
+        catch (e) {
+          lastError = e
+        }
+      }
+
+      return null
+    }
+
+    response = await attempt()
+    if (!response) {
+      await new Promise(r => setTimeout(r, this.config.retryDelay))
+      response = await attempt()
+    }
+    if (!response)
+      throw lastError || new Error('Failed to reach stream endpoint')
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Server responded with ${response.status}: ${errorText}`)
+    }
+
+    const stream = response.body
+    if (!stream)
+      throw new Error('No ReadableStream from stream response')
+
+    const reader = stream.getReader()
+    const decoder = new TextDecoder()
+    const modules = new Map()
+    const boundaryRowMap = new Map()
+
+    const convertRscToReact = (element: any): any => {
+      if (!createElement) {
+        console.error('React not available for RSC conversion')
+        return null
+      }
+
+      if (!element)
+        return null
+
+      if (typeof element === 'string' || typeof element === 'number' || typeof element === 'boolean')
+        return element
+
+      if (Array.isArray(element)) {
+        if (element.length >= 4 && element[0] === '$') {
+          const [, type, key, props] = element
+
+          if (type === 'react.suspense' || type === 'suspense') {
+            const suspenseProps = {
+              fallback: convertRscToReact(props?.fallback) || null,
+            }
+
+            const children = props?.children ? convertRscToReact(props.children) : null
+
+            return createElement(Suspense, suspenseProps, children)
+          }
+
+          let processedProps = props ? { ...props } : {}
+          if (props?.children) {
+            const child = convertRscToReact(props.children)
+            if (Array.isArray(child)) {
+              processedProps.children = child.map((c, i) => {
+                if (isValidElement(c) && c.key == null) {
+                  // eslint-disable-next-line react/no-clone-element, react/no-array-index-key
+                  return cloneElement(c, { key: i })
+                }
+
+                return c
+              })
+            }
+            else {
+              processedProps.children = child
+            }
+          }
+
+          if (typeof type === 'string') {
+            if (type.startsWith('$L')) {
+              const mod = modules.get(type)
+              if (mod) {
+                const clientKey = `${mod.id}#${mod.name || 'default'}`
+                const clientComponent = getClientComponent(clientKey)
+                if (clientComponent) {
+                  const reactElement = createElement(clientComponent, key ? { ...processedProps, key } : processedProps)
+                  return reactElement
+                }
+              }
+
+              return processedProps && processedProps.children ? processedProps.children : null
+            }
+            if (type.includes('.tsx#') || type.includes('.jsx#')) {
+              const clientComponent = getClientComponent(type)
+              if (clientComponent) {
+                const reactElement = createElement(clientComponent, key ? { ...processedProps, key } : processedProps)
+                return reactElement
+              }
+              else {
+                console.error('Failed to resolve client component:', type)
+                return null
+              }
+            }
+            else {
+              if (processedProps && Object.hasOwn(processedProps, '~boundaryId')) {
+                processedProps = { ...processedProps }
+                delete processedProps['~boundaryId']
+              }
+              const reactElement = createElement(type, key ? { ...processedProps, key } : processedProps)
+              return reactElement
+            }
+          }
+          else {
+            console.error('Unknown RSC element type:', type)
+          }
+        }
+
+        return element.map((child) => {
+          const converted = convertRscToReact(child)
+          return converted
+        })
+      }
+
+      if (typeof element === 'object') {
+        console.error('Unexpected object in RSC conversion:', element)
+        return null
+      }
+
+      return element
+    }
+
+    let initialContent: any = null
+    const boundaryUpdates = new Map()
+    let buffered = ''
+    let streamingComponent: any = null
+
+    const processStream = async () => {
+      const newlineChar = String.fromCharCode(10)
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done)
+            break
+
+          const chunk = decoder.decode(value, { stream: true })
+          buffered += chunk
+
+          const lines = buffered.split(newlineChar)
+          const completeLines = lines.slice(0, -1)
+          buffered = lines.at(-1) || ''
+
+          for (const line of completeLines) {
+            if (!line.trim())
+              continue
+
+            try {
+              const colonIndex = line.indexOf(':')
+              if (colonIndex === -1)
+                continue
+
+              const rowId = line.substring(0, colonIndex)
+              const content = line.substring(colonIndex + 1)
+
+              const importRow = parseImportRow(content)
+              if (importRow) {
+                modules.set(`$L${rowId}`, importRow)
+              }
+              else if (content.startsWith('E{')) {
+                try {
+                  const err = JSON.parse(content.substring(1))
+                  console.error('RSC stream error:', err)
+                }
+                catch (e) {
+                  console.error('Failed to parse error row:', content, e)
+                }
+              }
+              else if (content.startsWith('Symbol.for(')) {
+                continue
+              }
+              else if (content.startsWith('[')) {
+                const parsed = JSON.parse(content)
+                if (Array.isArray(parsed) && parsed.length >= 4) {
+                  const [marker, selector, props] = parsed
+                  const boundaryId = props?.['~boundaryId']
+                  if (marker === '$' && (selector === 'react.suspense' || selector === 'suspense') && props && boundaryId)
+                    boundaryRowMap.set(`$L${rowId}`, boundaryId)
+
+                  if (marker === '$' && props && Object.hasOwn(props, 'children')) {
+                    if (typeof selector === 'string' && selector.startsWith('$L')) {
+                      const target = boundaryRowMap.get(selector) || null
+                      if (target) {
+                        const resolvedContent = convertRscToReact(props.children)
+                        boundaryUpdates.set(target, resolvedContent)
+                        if (streamingComponent)
+                          streamingComponent.updateBoundary(target, resolvedContent)
+
+                        continue
+                      }
+                    }
+                  }
+                }
+                if (!initialContent) {
+                  let canUseAsRoot = true
+                  if (Array.isArray(parsed) && parsed.length >= 4 && parsed[0] === '$') {
+                    const sel = parsed[1]
+                    const p = parsed[3]
+                    const boundaryId = p?.['~boundaryId']
+                    if (typeof sel === 'string' && (sel === 'react.suspense' || sel === 'suspense') && p && boundaryId)
+                      canUseAsRoot = false
+                  }
+                  if (canUseAsRoot) {
+                    initialContent = convertRscToReact(parsed)
+                    if (streamingComponent && typeof streamingComponent.updateRoot === 'function')
+                      streamingComponent.updateRoot()
+                  }
+                }
+              }
+            }
+            catch (e) {
+              console.error('Failed to parse stream line:', line, e)
+            }
+          }
+        }
+      }
+      catch (error) {
+        console.error('Error processing stream:', error)
+      }
+    }
+
+    // oxlint-disable-next-line react/component-hook-factories
+    const StreamingWrapper = (): any => {
+      // eslint-disable-next-line react/use-state
+      const [, setRenderTrigger] = useState(0)
+
+      useEffect(() => {
+        streamingComponent = {
+          updateBoundary: (boundaryId: string, resolvedContent: any) => {
+            boundaryUpdates.set(boundaryId, resolvedContent)
+            setRenderTrigger((prev: number) => prev + 1)
+          },
+          updateRoot: () => {
+            setRenderTrigger((prev: number) => prev + 1)
+          },
+        }
+
+        return () => {
+          streamingComponent = null
+        }
+      }, [setRenderTrigger])
+
+      const renderWithBoundaryUpdates = (element: any): any => {
+        if (!element)
+          return null
+
+        if (isValidElement(element)) {
+          const props = element.props as any
+          const boundaryId = props?.['~boundaryId']
+          if (props && boundaryId) {
+            const resolvedContent = boundaryUpdates.get(boundaryId)
+            if (resolvedContent)
+              return resolvedContent
+          }
+
+          if (props && props.children) {
+            const updatedChildren = renderWithBoundaryUpdates(props.children)
+            if (updatedChildren !== props.children) {
+              const propsForCreate = { ...props }
+              if (element.key !== null && element.key !== undefined) {
+                propsForCreate.key = element.key
+              }
+
+              return createElement(element.type, propsForCreate, updatedChildren)
+            }
+          }
+
+          return element
+        }
+
+        if (Array.isArray(element))
+          return element.map(child => renderWithBoundaryUpdates(child))
+
+        return element
+      }
+
+      const renderedContent = renderWithBoundaryUpdates(initialContent)
+      return renderedContent
+    }
+
+    processStream()
+
+    const rootPromise = Promise.resolve(createElement(StreamingWrapper))
+
+    return {
+      '~isRscResponse': true,
+      '~rscPromise': rootPromise,
+      readRoot() {
+        return rootPromise
+      },
+    }
+  }
+
+  buildRequestHeaders(): Record<string, string> {
+    const headers = {
+      'Accept': 'text/x-component',
+      'Cache-Control': 'no-cache, no-transform',
+    }
+
+    return headers
+  }
+
+  async fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), this.config.timeout)
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      })
+      clearTimeout(timeoutId)
+      return response
+    }
+    catch (error) {
+      clearTimeout(timeoutId)
+      throw error
+    }
+  }
+
+  async processRscResponse(response: Response): Promise<any> {
+    await loadRscClient()
+
+    if (createFromFetch) {
+      try {
+        const rscPromise = createFromFetch(Promise.resolve(response))
+        return {
+          '~isRscResponse': true,
+          '~rscPromise': rscPromise,
+          readRoot() {
+            return rscPromise
+          },
+        }
+      }
+      catch {
+        throw new Error('React Server DOM client not available')
+      }
+    }
+    else {
+      throw new Error('React Server DOM client not available')
+    }
+  }
+
+  async processRscResponseManually(response: Response): Promise<any> {
+    const rscPayload = await response.text()
+    const result = this.parseRscResponse(rscPayload)
+    return result
+  }
+
+  parseRscResponse(rscPayload: string): any {
+    const lines = rscPayload.trim().split(NEWLINE_REGEX)
+    const modules = new Map()
+    const elements = new Map()
+    const errors = []
+
+    for (const line of lines) {
+      const colonIndex = line.indexOf(':')
+      if (colonIndex === -1)
+        continue
+
+      const rowId = line.substring(0, colonIndex)
+      const rest = line.substring(colonIndex + 1)
+
+      if (!rest)
+        continue
+
+      try {
+        const importRow = parseImportRow(rest)
+        if (importRow) {
+          modules.set(`$L${rowId}`, importRow)
+        }
+        else if (rest.startsWith('E{')) {
+          const data = rest.substring(1)
+          const errorData = JSON.parse(data)
+          errors.push(errorData)
+          console.error('RSC: Server error', errorData)
+        }
+        else if (rest.startsWith('[')) {
+          const elementData = JSON.parse(rest)
+          elements.set(rowId, elementData)
+        }
+        else if (rest.startsWith('Symbol.for(')) {
+          continue
+        }
+        else {
+          console.error('Unknown RSC row format:', line)
+        }
+      }
+      catch (e) {
+        console.error('Failed to parse RSC row:', line, e)
+      }
+    }
+
+    if (errors.length > 0)
+      throw new Error(`RSC Server Error: ${errors.map(e => e.message || e).join(', ')}`)
+
+    let rootElement = null
+
+    const elementKeys = Array.from(elements.keys()).sort(
+      (a, b) => Number.parseInt(a, 16) - Number.parseInt(b, 16),
+    )
+    for (const key of elementKeys) {
+      const element = elements.get(key)
+      if (Array.isArray(element) && element.length >= 2 && element[0] === '$') {
+        const [, type, , props] = element
+        const boundaryId = props?.['~boundaryId']
+        if (type === 'react.suspense' && props && boundaryId)
+          continue
+
+        rootElement = element
+        break
+      }
+    }
+
+    if (!rootElement) {
+      console.error('No valid root element found in RSC payload', { elements, modules })
+      return null
+    }
+
+    return this.reconstructElementFromRscData(rootElement, modules)
+  }
+
+  reconstructElementFromRscData(elementData: any, modules: Map<string, ModuleData>): any {
+    if (elementData === null || elementData === undefined)
+      return null
+
+    if (typeof elementData === 'string' || typeof elementData === 'number' || typeof elementData === 'boolean')
+      return elementData
+
+    if (Array.isArray(elementData)) {
+      if (elementData.length >= 4 && elementData[0] === '$') {
+        const [, type, key, props] = elementData
+
+        let actualType = type
+
+        if (typeof type === 'string' && type.includes('#')) {
+          const clientComponent = getClientComponent(type)
+          if (clientComponent) {
+            actualType = clientComponent
+          }
+          else {
+            actualType = ({ children, ...restProps }: any) => createElement(
+              'div',
+              {
+                ...restProps,
+                'data-client-component': type,
+                'style': {
+                  border: '2px dashed #f00',
+                  padding: '8px',
+                  margin: '4px',
+                  backgroundColor: '#fff0f0',
+                },
+              },
+              createElement('small', { style: { color: '#c00' } }, `Missing Client Component: ${type}`,
+              ),
+              children,
+            )
+          }
+        }
+        else if (typeof type === 'string' && type.startsWith('$L')) {
+          if (modules.has(type)) {
+            const moduleData = modules.get(type)
+            if (moduleData) {
+              const clientComponentKey = `${moduleData.id}#${moduleData.name}`
+
+              const clientComponent = getClientComponent(clientComponentKey)
+
+              if (clientComponent) {
+                actualType = clientComponent
+              }
+              else {
+                actualType = ({ children, ...restProps }: any) => createElement(
+                  'div',
+                  {
+                    ...restProps,
+                    'data-client-component': type,
+                    'style': {
+                      border: '2px dashed #f00',
+                      padding: '8px',
+                      margin: '4px',
+                      backgroundColor: '#fff0f0',
+                    },
+                  },
+                  createElement('small', { style: { color: '#c00' } }, `Missing Client Component: ${moduleData.name} (${moduleData.id})`,
+                  ),
+                  children,
+                )
+              }
+            }
+          }
+        }
+
+        const processedProps = props ? this.processPropsRecursively(props, modules) : {}
+
+        return createElement(actualType, { key, ...processedProps })
+      }
+      else {
+        return elementData.map(item => this.reconstructElementFromRscData(item, modules))
+      }
+    }
+
+    if (typeof elementData === 'object')
+      return null
+
+    return elementData
+  }
+
+  processPropsRecursively(props: any, modules: Map<string, ModuleData>): any {
+    if (!props || typeof props !== 'object')
+      return props
+
+    const processed: Record<string, any> = {}
+
+    for (const [key, value] of Object.entries(props)) {
+      if (key === 'children') {
+        if (Array.isArray(value)) {
+          if (value.length >= 2 && value[0] === '$') {
+            const result = this.reconstructElementFromRscData(value, modules)
+            processed[key] = result
+          }
+          else {
+            const processedChildren = value.map((child) => {
+              const result = this.reconstructElementFromRscData(child, modules)
+              return result
+            }).filter(child => child !== null && child !== undefined)
+
+            if (processedChildren.length === 0)
+              processed[key] = null
+            else if (processedChildren.length === 1)
+              processed[key] = processedChildren[0]
+            else
+              processed[key] = processedChildren
+          }
+        }
+        else {
+          const processedChild = this.reconstructElementFromRscData(value, modules)
+          processed[key] = processedChild
+        }
+      }
+      else if (key === 'dangerouslySetInnerHTML') {
+        processed[key] = value
+      }
+      else {
+        processed[key] = this.reconstructElementFromRscData(value, modules)
+      }
+    }
+
+    return processed
+  }
+}
+
+const rscClient = new RscClient()
+
+function RscErrorComponent({ error, details }: { error: string, details?: any }): any {
+  return createElement('div', {
+    className: 'rsc-error',
+    style: {
+      padding: '16px',
+      backgroundColor: '#fee',
+      border: '1px solid #fcc',
+      borderRadius: '4px',
+      margin: '8px 0',
+      fontFamily: 'monospace',
+    },
+  }, createElement('h3', { style: { margin: '0 0 8px 0', color: '#c00' } }, 'RSC Error'), createElement('p', { style: { margin: '0 0 8px 0' } }, error), details && createElement('details', { style: { marginTop: '8px' } }, createElement('summary', { style: { cursor: 'pointer' } }, 'Error Details'), createElement('pre', { style: { fontSize: '12px', overflow: 'auto', backgroundColor: '#f5f5f5', padding: '8px' } }, JSON.stringify(details, null, 2),
+  )))
+}
+
+function RscRootReader({ rootPromise }: { rootPromise: Promise<any> }): any {
+  return use(rootPromise)
+}
+
+function ServerComponentWrapper({
+  componentId,
+  props,
+  fallback,
+}: {
+  componentId: string
+  props: any
+  fallback?: any
+}): any {
+  const hmrCounter = (typeof window !== 'undefined' && (window as unknown as WindowWithRari)['~rari']?.hmr?.refreshCounters?.[componentId]) || 0
+  const propsKey = JSON.stringify(props)
+  const cacheKey = `${componentId}:${propsKey}:hmr:${hmrCounter}`
+
+  if (!serverComponentCache.has(cacheKey)) {
+    const promise = rscClient.fetchServerComponent(componentId, props)
+      .catch((err) => {
+        serverComponentCache.delete(cacheKey)
+        throw err
+      })
+    serverComponentCache.set(cacheKey, promise)
+  }
+
+  const promise = serverComponentCache.get(cacheKey)!
+  const data = use(promise)
+
+  if (data?.['~isRscResponse']) {
+    const rootPromise = (data as any).readRoot()
+    return createElement(Suspense, { fallback: fallback ?? null }, createElement(RscRootReader, { rootPromise }))
+  }
+
+  return data ?? null
+}
+
+class ServerComponentErrorBoundary extends React.Component<
+  { children: any, componentId: string, mountKey: number },
+  { hasError: boolean, error: Error | null }
+> {
+  constructor(props: any) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error }
+  }
+
+  componentDidUpdate(prevProps: { mountKey: number }) {
+    if (prevProps.mountKey !== this.props.mountKey && this.state.hasError) {
+      this.setState({ hasError: false, error: null })
+    }
+  }
+
+  componentDidCatch(error: Error, errorInfo: any) {
+    console.error(`[rari] ServerComponentErrorBoundary: Error in component ${this.props.componentId}:`, error, errorInfo)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return createElement(RscErrorComponent, {
+        error: this.state.error?.message || 'Unknown error',
+        details: { componentId: this.props.componentId },
+      })
+    }
+
+    return this.props.children
+  }
+}
+
+function createServerComponentWrapper(componentName: string): (props: any) => any {
+  let globalRefreshCounter = 0
+
+  if (typeof window !== 'undefined') {
+    const windowWithRari = window as unknown as WindowWithRari
+    if (!windowWithRari['~rari'].hmr)
+      windowWithRari['~rari'].hmr = { refreshCounters: {} }
+    if (windowWithRari['~rari'].hmr!.refreshCounters[componentName] === undefined)
+      windowWithRari['~rari'].hmr!.refreshCounters[componentName] = 0
+
+    globalRefreshCounter = windowWithRari['~rari'].hmr!.refreshCounters[componentName]!
+  }
+
+  // oxlint-disable-next-line react/component-hook-factories
+  const ServerComponent = (props: any): any => {
+    const [mountKey, setMountKey] = useState(globalRefreshCounter)
+
+    useEffect(() => {
+      const handleRscInvalidate = (event: Event) => {
+        const detail = (event as CustomEvent).detail
+        if (detail && detail.filePath && isServerComponent(detail.filePath)) {
+          rscClient.clearCache()
+
+          if (typeof window !== 'undefined') {
+            const windowWithRari = window as unknown as WindowWithRari
+            if (!windowWithRari['~rari'].hmr)
+              windowWithRari['~rari'].hmr = { refreshCounters: {} }
+
+            windowWithRari['~rari'].hmr!.refreshCounters[componentName] = (windowWithRari['~rari'].hmr!.refreshCounters[componentName] || 0) + 1
+            setMountKey(windowWithRari['~rari'].hmr!.refreshCounters[componentName])
+          }
+        }
+      }
+
+      if (typeof window !== 'undefined')
+        window.addEventListener('rari:rsc-invalidate', handleRscInvalidate)
+
+      return () => {
+        if (typeof window !== 'undefined')
+          window.removeEventListener('rari:rsc-invalidate', handleRscInvalidate)
+      }
+    }, [])
+
+    return createElement(Suspense, {
+      fallback: null,
+    }, createElement(ServerComponentErrorBoundary, {
+      componentId: componentName,
+      mountKey,
+    }, createElement(ServerComponentWrapper, {
+      key: `${componentName}-${mountKey}`,
+      componentId: componentName,
+      props,
+      fallback: null,
+    })))
+  }
+
+  ServerComponent.displayName = `ServerComponent(${componentName})`
+
+  return function (props: any): any {
+    return createElement(ServerComponent, props)
+  }
+}
+
+export function fetchServerComponent(componentId: string, props: any): Promise<any> {
+  return rscClient.fetchServerComponent(componentId, props)
+}
+
+function isServerComponent(filePath: string): boolean {
+  if (!filePath)
+    return false
+
+  try {
+    if (typeof globalThis !== 'undefined' && (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents)
+      return (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents!.has(filePath)
+
+    return false
+  }
+  catch (error) {
+    console.error('Error checking if file is server component:', error)
+    return false
+  }
+}
+
+if (import.meta.hot) {
+  let hmrListenersReady = false
+  const bufferedEvents: Array<{ event: string, data: any }> = []
+  const handlers = new Map<string, (data: any) => void | Promise<void>>()
+
+  function registerHandler(event: string, handler: (data: any) => void | Promise<void>) {
+    handlers.set(event, handler)
+    import.meta.hot!.on(event, async (data) => {
+      if (!hmrListenersReady) {
+        bufferedEvents.push({ event, data })
+        return
+      }
+      try {
+        await handler(data)
+      }
+      catch (error) {
+        console.error(`[rari] HMR: Error in handler for '${event}':`, error)
+      }
+    })
+  }
+
+  registerHandler('rari:register-server-component', (data) => {
+    if (data?.filePath) {
+      if (typeof globalThis !== 'undefined') {
+        ; (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents = (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents || new Set()
+        ; (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents!.add(data.filePath)
+      }
+    }
+  })
+
+  registerHandler('rari:server-components-registry', (data) => {
+    if (data?.serverComponents && Array.isArray(data.serverComponents)) {
+      if (typeof globalThis !== 'undefined') {
+        ; (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents = (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents || new Set()
+        data.serverComponents.forEach((path: string) => {
+          ; (globalThis as unknown as GlobalWithRari)['~rari'].serverComponents?.add(path)
+        })
+      }
+    }
+  })
+
+  registerHandler('vite:beforeFullReload', async (data) => {
+    if (data?.path && isServerComponent(data.path))
+      await invalidateRscCache({ filePath: data.path, forceReload: true })
+  })
+
+  registerHandler('rari:server-component-updated', async (data) => {
+    const componentId = data?.id || data?.componentId
+    const timestamp = data?.t || data?.timestamp
+
+    if (componentId) {
+      if (typeof window !== 'undefined') {
+        const event = new CustomEvent('rari:rsc-invalidate', {
+          detail: {
+            componentId,
+            filePath: data.filePath || data.file,
+            type: 'server-component',
+            timestamp,
+          },
+        })
+        window.dispatchEvent(event)
+      }
+    }
+    else if (data?.path && isServerComponent(data.path)) {
+      await invalidateRscCache({ filePath: data.path, forceReload: false })
+    }
+  })
+
+  registerHandler('rari:app-router-updated', async (data) => {
+    try {
+      if (!data)
+        return
+
+      if (!data.routePath && (!data.affectedRoutes || data.affectedRoutes.length === 0))
+        return
+
+      await handleAppRouterUpdate(data)
+    }
+    catch (error) {
+      console.error('[rari] HMR: App router update failed:', error)
+    }
+  })
+
+  registerHandler('rari:server-action-updated', async (data) => {
+    if (data?.filePath) {
+      rscClient.clearCache()
+
+      if (typeof window !== 'undefined') {
+        const event = new CustomEvent('rari:rsc-invalidate', {
+          detail: { filePath: data.filePath, type: 'server-action' },
+        })
+        window.dispatchEvent(event)
+      }
+    }
+  })
+
+  async function handleAppRouterUpdate(data: any): Promise<void> {
+    const fileType = data.fileType
+    const filePath = data.filePath
+    const routePath = data.routePath
+    const affectedRoutes = data.affectedRoutes
+    const manifestUpdated = data.manifestUpdated
+    const metadata = data.metadata
+    const metadataChanged = data.metadataChanged
+
+    if (metadataChanged && metadata)
+      updateDocumentMetadata(metadata)
+
+    try {
+      const rariServerUrl = resolveRariServerUrl()
+      const reloadUrl = `${rariServerUrl}/_rari/hmr`
+
+      const reloadResponse = await fetch(reloadUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action: 'register',
+          file_path: filePath,
+        }),
+      })
+
+      if (!reloadResponse.ok) {
+        const responseBody = await reloadResponse.text()
+        const errorMsg = `Component reload failed with status ${reloadResponse.status}: ${responseBody}`
+        console.error('[rari] HMR:', errorMsg)
+        throw new Error(errorMsg)
+      }
+
+      const result = await reloadResponse.json()
+
+      if (result == null || typeof result !== 'object') {
+        const errorMsg = 'Invalid reload response: null or non-object'
+        console.error('[rari] HMR:', errorMsg, result)
+        throw new Error(errorMsg)
+      }
+
+      if (result.success !== true && result.reloaded !== true) {
+        const errorMsg = `Component reload unsuccessful: ${result.error || 'unknown error'}`
+        console.error('[rari] HMR:', errorMsg, result)
+        throw new Error(errorMsg)
+      }
+    }
+    catch (error) {
+      console.error('[rari] HMR: Failed to reload component:', error)
+      return
+    }
+
+    let routes = [routePath]
+    switch (fileType) {
+      case 'page':
+        routes = [routePath]
+        break
+      case 'layout':
+      case 'loading':
+      case 'error':
+      case 'not-found':
+        routes = affectedRoutes
+        break
+      default:
+        break
+    }
+
+    await invalidateAppRouterCache({ routes, fileType, filePath, componentId: routePath })
+
+    if (manifestUpdated)
+      await reloadAppRouterManifest()
+
+    await triggerAppRouterRerender({ routePath, affectedRoutes })
+  }
+
+  function updateDocumentMetadata(metadata: any): void {
+    if (typeof document === 'undefined')
+      return
+
+    if (metadata.title)
+      document.title = metadata.title
+
+    if (metadata.description) {
+      let metaDesc = document.querySelector('meta[name="description"]')
+      if (!metaDesc) {
+        metaDesc = document.createElement('meta')
+        metaDesc.setAttribute('name', 'description')
+        document.head.appendChild(metaDesc)
+      }
+      metaDesc.setAttribute('content', metadata.description)
+    }
+  }
+
+  function clearCacheForRoutes(routes: string[]): void {
+    if (!routes || routes.length === 0) {
+      rscClient.clearCache()
+      return
+    }
+
+    const keysToDelete = []
+    for (const key of rscClient.componentCache.keys()) {
+      for (const route of routes) {
+        if (key.includes(`route:${route}:`) || key.startsWith(`${route}:`)) {
+          keysToDelete.push(key)
+          break
+        }
+        if (route !== '/' && key.includes(`route:${route}/`)) {
+          keysToDelete.push(key)
+          break
+        }
+      }
+    }
+
+    for (const key of keysToDelete) {
+      rscClient.componentCache.delete(key)
+      serverComponentCache.delete(key)
+    }
+
+    const serverCacheKeysToDelete = []
+    for (const key of serverComponentCache.keys()) {
+      for (const route of routes) {
+        if (key.includes(`route:${route}:`) || key.startsWith(`${route}:`)) {
+          serverCacheKeysToDelete.push(key)
+          break
+        }
+        if (route !== '/' && key.includes(`route:${route}/`)) {
+          serverCacheKeysToDelete.push(key)
+          break
+        }
+      }
+    }
+
+    for (const key of serverCacheKeysToDelete)
+      serverComponentCache.delete(key)
+  }
+
+  async function invalidateAppRouterCache(data: any): Promise<void> {
+    const routes = data.routes || []
+    const fileType = data.fileType
+    const filePath = data.filePath
+    const componentId = data.componentId
+
+    if (componentId || filePath) {
+      try {
+        const rariServerUrl = resolveRariServerUrl()
+
+        const invalidateUrl = `${rariServerUrl}/_rari/hmr`
+
+        const invalidateResponse = await fetch(invalidateUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            action: 'invalidate',
+            componentId: componentId || filePath,
+            filePath,
+          }),
+        })
+
+        const responseBody = await invalidateResponse.text()
+
+        if (!invalidateResponse.ok) {
+          console.error('[rari] HMR: Server cache invalidation failed:', invalidateResponse.status, responseBody)
+        }
+      }
+      catch (error) {
+        console.error('[rari] HMR: Failed to call server invalidation endpoint:', error)
+      }
+    }
+
+    clearCacheForRoutes(routes)
+
+    if (typeof window !== 'undefined') {
+      const event = new CustomEvent('rari:rsc-invalidate', {
+        detail: { routes, fileType },
+      })
+      window.dispatchEvent(event)
+    }
+  }
+
+  async function triggerAppRouterRerender(data: any): Promise<void> {
+    const routePath = data.routePath
+    const affectedRoutes = data.affectedRoutes || [routePath]
+
+    if (typeof window === 'undefined')
+      return
+
+    try {
+      const currentPath = window.location.pathname
+
+      const event = new CustomEvent('rari:app-router-rerender', {
+        detail: {
+          routePath,
+          affectedRoutes,
+          currentPath,
+          preserveParams: true,
+        },
+      })
+      window.dispatchEvent(event)
+    }
+    catch (error) {
+      console.error('[rari] HMR: Failed to trigger re-render:', error)
+      throw error
+    }
+  }
+
+  async function reloadAppRouterManifest(): Promise<void> {
+    if (typeof window !== 'undefined' && (window as unknown as WindowWithRari)['~rari']?.routeInfoCache) {
+      const windowWithRari = window as unknown as WindowWithRari
+      windowWithRari['~rari'].routeInfoCache!.clear()
+    }
+  }
+
+  async function invalidateRscCache(data: any): Promise<void> {
+    const filePath = data?.filePath || data
+
+    rscClient.clearCache()
+
+    if (typeof window !== 'undefined') {
+      const event = new CustomEvent('rari:rsc-invalidate', {
+        detail: { filePath },
+      })
+      window.dispatchEvent(event)
+    }
+  }
+
+  if (bufferedEvents.length > 0) {
+    void (async () => {
+      try {
+        while (bufferedEvents.length > 0) {
+          const eventsToReplay = [...bufferedEvents]
+          bufferedEvents.length = 0
+
+          for (const { event, data } of eventsToReplay) {
+            const handler = handlers.get(event)
+            if (handler) {
+              try {
+                await handler(data)
+              }
+              catch (error) {
+                console.error(`[rari] HMR: Error replaying buffered event '${event}':`, error)
+              }
+            }
+          }
+        }
+      }
+      catch (error) {
+        console.error('[rari] HMR: Error during event replay:', error)
+      }
+      finally {
+        hmrListenersReady = true
+      }
+    })()
+  }
+  else {
+    hmrListenersReady = true
+  }
+}
+
+class HMRErrorOverlay {
+  overlay: HTMLElement | null
+  currentError: any
+  private escapeKeyHandler: ((e: KeyboardEvent) => void) | null
+
+  constructor() {
+    this.overlay = null
+    this.currentError = null
+    this.escapeKeyHandler = null
+  }
+
+  show(error: any): void {
+    this.currentError = error
+    if (this.overlay)
+      this.updateOverlay(error)
+    else
+      this.createOverlay(error)
+  }
+
+  hide(): void {
+    if (this.overlay) {
+      this.overlay.remove()
+      this.overlay = null
+      this.currentError = null
+    }
+    if (this.escapeKeyHandler) {
+      document.removeEventListener('keydown', this.escapeKeyHandler)
+      this.escapeKeyHandler = null
+    }
+  }
+
+  isVisible(): boolean {
+    return this.overlay !== null
+  }
+
+  createOverlay(error: any): void {
+    this.overlay = document.createElement('div')
+    this.overlay.id = 'rari-hmr-error-overlay'
+    this.updateOverlay(error)
+    document.body.appendChild(this.overlay)
+
+    this.escapeKeyHandler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape')
+        this.hide()
+    }
+    document.addEventListener('keydown', this.escapeKeyHandler)
+  }
+
+  updateOverlay(error: any): void {
+    if (!this.overlay)
+      return
+
+    this.overlay.replaceChildren()
+
+    const container = document.createElement('div')
+    container.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.85); z-index: 999999; display: flex; align-items: center; justify-content: center; padding: 2rem; backdrop-filter: blur(4px);'
+
+    const content = document.createElement('div')
+    content.style.cssText = 'background: #1e1e1e; color: #e0e0e0; border-radius: 0.5rem; padding: 2rem; max-width: 50rem; width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4); border: 1px solid #ef4444;'
+
+    const header = document.createElement('div')
+    header.style.cssText = 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem;'
+
+    const headerLeft = document.createElement('div')
+    headerLeft.style.cssText = 'display: flex; align-items: center; gap: 0.75rem;'
+
+    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+    icon.style.cssText = 'width: 2rem; height: 2rem; color: #ef4444;'
+    icon.setAttribute('fill', 'none')
+    icon.setAttribute('stroke', 'currentColor')
+    icon.setAttribute('viewBox', '0 0 24 24')
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    path.setAttribute('stroke-linecap', 'round')
+    path.setAttribute('stroke-linejoin', 'round')
+    path.setAttribute('stroke-width', '2')
+    path.setAttribute('d', 'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z')
+    icon.appendChild(path)
+
+    const title = document.createElement('h1')
+    title.style.cssText = 'margin: 0; font-size: 1.5rem; font-weight: 700; color: #ef4444;'
+    title.textContent = 'Build Error'
+
+    headerLeft.appendChild(icon)
+    headerLeft.appendChild(title)
+
+    const closeButton = document.createElement('button')
+    closeButton.style.cssText = 'background: transparent; border: none; color: #9ca3af; cursor: pointer; padding: 0.5rem; border-radius: 0.25rem; transition: all 0.2s; font-size: 1.5rem; line-height: 1; width: 2rem; height: 2rem; display: flex; align-items: center; justify-content: center;'
+    closeButton.textContent = '×'
+    closeButton.setAttribute('aria-label', 'Close overlay')
+    closeButton.onclick = () => this.hide()
+    closeButton.onmouseover = () => {
+      closeButton.style.background = 'rgba(255,255,255,0.1)'
+      closeButton.style.color = '#e0e0e0'
+    }
+    closeButton.onmouseout = () => {
+      closeButton.style.background = 'transparent'
+      closeButton.style.color = '#9ca3af'
+    }
+    closeButton.onfocus = () => {
+      closeButton.style.background = 'rgba(255,255,255,0.1)'
+      closeButton.style.color = '#e0e0e0'
+    }
+    closeButton.onblur = () => {
+      closeButton.style.background = 'transparent'
+      closeButton.style.color = '#9ca3af'
+    }
+
+    header.appendChild(headerLeft)
+    header.appendChild(closeButton)
+    content.appendChild(header)
+
+    if (error.filePath) {
+      const fileInfo = document.createElement('div')
+      fileInfo.style.cssText = 'margin-bottom: 1rem; padding: 0.75rem; background: rgba(0, 0, 0, 0.2); border-radius: 0.375rem; font-family: monospace; font-size: 0.875rem;'
+      const fileLabel = document.createElement('strong')
+      fileLabel.textContent = 'File: '
+      fileInfo.appendChild(fileLabel)
+      fileInfo.appendChild(document.createTextNode(error.filePath))
+      content.appendChild(fileInfo)
+    }
+
+    const errorSection = document.createElement('div')
+    errorSection.style.cssText = 'margin-bottom: 1.5rem;'
+
+    const errorTitle = document.createElement('h2')
+    errorTitle.style.cssText = 'margin: 0 0 0.75rem 0; font-size: 1rem; font-weight: 600; color: #fca5a5;'
+    errorTitle.textContent = 'Error Message:'
+
+    const errorPre = document.createElement('pre')
+    errorPre.style.cssText = 'margin: 0; padding: 1rem; background: rgba(239, 68, 68, 0.1); border-left: 4px solid #ef4444; border-radius: 0.375rem; overflow-x: auto; font-family: monospace; font-size: 0.875rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: #fca5a5;'
+    errorPre.textContent = error.message ?? 'An error occurred'
+
+    errorSection.appendChild(errorTitle)
+    errorSection.appendChild(errorPre)
+    content.appendChild(errorSection)
+
+    if (error.stack) {
+      const details = document.createElement('details')
+      details.style.cssText = 'margin-top: 1rem; cursor: pointer;'
+
+      const summary = document.createElement('summary')
+      summary.style.cssText = 'font-weight: 600; margin-bottom: 0.5rem; user-select: none;'
+      summary.textContent = 'Stack Trace'
+
+      const stackPre = document.createElement('pre')
+      stackPre.style.cssText = 'margin: 0; padding: 0.75rem; background: rgba(0, 0, 0, 0.2); border-radius: 0.375rem; overflow-x: auto; font-size: 0.875rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;'
+      stackPre.textContent = error.stack
+
+      details.appendChild(summary)
+      details.appendChild(stackPre)
+      content.appendChild(details)
+    }
+
+    const footer = document.createElement('div')
+    footer.style.cssText = 'margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid #374151; display: flex; gap: 0.75rem; align-items: center;'
+
+    const reloadButton = document.createElement('button')
+    reloadButton.style.cssText = 'padding: 0.625rem 1.25rem; background: #ef4444; color: white; border: none; border-radius: 0.375rem; cursor: pointer; font-weight: 600; font-size: 0.875rem; transition: all 0.2s;'
+    reloadButton.textContent = 'Reload Page'
+    reloadButton.onclick = () => window.location.reload()
+    reloadButton.onmouseover = () => {
+      reloadButton.style.background = '#dc2626'
+    }
+    reloadButton.onmouseout = () => {
+      reloadButton.style.background = '#ef4444'
+    }
+    reloadButton.onfocus = () => {
+      reloadButton.style.background = '#dc2626'
+    }
+    reloadButton.onblur = () => {
+      reloadButton.style.background = '#ef4444'
+    }
+
+    const dismissButton = document.createElement('button')
+    dismissButton.style.cssText = 'padding: 0.625rem 1.25rem; background: #374151; color: #e0e0e0; border: none; border-radius: 0.375rem; cursor: pointer; font-weight: 600; font-size: 0.875rem; transition: all 0.2s;'
+    dismissButton.textContent = 'Dismiss'
+    dismissButton.onclick = () => this.hide()
+    dismissButton.onmouseover = () => {
+      dismissButton.style.background = '#4b5563'
+    }
+    dismissButton.onmouseout = () => {
+      dismissButton.style.background = '#374151'
+    }
+    dismissButton.onfocus = () => {
+      dismissButton.style.background = '#4b5563'
+    }
+    dismissButton.onblur = () => {
+      dismissButton.style.background = '#374151'
+    }
+
+    const timestamp = document.createElement('span')
+    timestamp.style.cssText = 'margin-left: auto; font-size: 0.75rem; color: #9ca3af;'
+    const timestampDate = new Date(error.timestamp)
+    timestamp.textContent = !Number.isNaN(timestampDate.valueOf()) ? timestampDate.toLocaleTimeString() : ''
+
+    footer.appendChild(reloadButton)
+    footer.appendChild(dismissButton)
+    footer.appendChild(timestamp)
+    content.appendChild(footer)
+
+    container.appendChild(content)
+    this.overlay.appendChild(container)
+  }
+}
+
+let hmrErrorOverlay: HMRErrorOverlay | null = null
+
+function getErrorOverlay(): HMRErrorOverlay {
+  if (!hmrErrorOverlay)
+    hmrErrorOverlay = new HMRErrorOverlay()
+
+  return hmrErrorOverlay
+}
+
+if (import.meta.hot) {
+  const overlay = getErrorOverlay()
+
+  import.meta.hot.on('rari:hmr-error', (data) => {
+    const message = data.msg || data.message
+    const filePath = data.file || data.filePath
+    const timestamp = data.t || data.timestamp
+    const errorCount = data.count || data.errorCount
+    const maxErrors = data.max || data.maxErrors
+
+    console.error('[rari] HMR: Build error:', message)
+
+    if (filePath)
+      console.error('[rari] HMR: File:', filePath)
+
+    if (data.stack)
+      console.error('[rari] HMR: Stack:', data.stack)
+
+    overlay.show({
+      message,
+      stack: data.stack,
+      filePath,
+      timestamp,
+    })
+
+    if (errorCount && maxErrors) {
+      if (errorCount >= maxErrors)
+        console.error(`[rari] HMR: Maximum error count (${maxErrors}) reached. Consider restarting the dev server if issues persist.`)
+      else if (errorCount >= maxErrors - 2)
+        console.warn(`[rari] HMR: Error count: ${errorCount}/${maxErrors}. Approaching maximum error threshold.`)
+    }
+  })
+
+  import.meta.hot.on('rari:hmr-error-cleared', () => {
+    overlay.hide()
+  })
+
+  import.meta.hot.on('vite:error', (data) => {
+    overlay.show({
+      message: data.err?.message || 'Unknown Vite error',
+      stack: data.err?.stack,
+      filePath: data.err?.file,
+      timestamp: Date.now(),
+    })
+  })
+}
+
+export {
+  createServerComponentWrapper,
+  rscClient,
+  RscErrorComponent,
+}

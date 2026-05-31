@@ -1,0 +1,624 @@
+use crate::error::RariError;
+#[cfg(test)]
+use crate::server::routing::types::RouteSegmentType;
+use crate::server::routing::types::{ParamValue, RouteSegment};
+use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use urlencoding::decode;
+
+fn parse_decoded_path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| decode(s).unwrap_or_else(|_| s.to_string().into()).into_owned())
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRouteEntry {
+    pub path: String,
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    pub segments: Vec<RouteSegment>,
+    pub params: Vec<String>,
+    #[serde(rename = "isDynamic")]
+    pub is_dynamic: bool,
+    #[serde(rename = "staticParams", default, skip_serializing_if = "Option::is_none")]
+    pub static_params: Option<Vec<FxHashMap<String, serde_json::Value>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutEntry {
+    pub path: String,
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    #[serde(rename = "parentPath", skip_serializing_if = "Option::is_none")]
+    pub parent_path: Option<String>,
+    #[serde(rename = "isRoot", default)]
+    pub is_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadingEntry {
+    pub path: String,
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorEntry {
+    pub path: String,
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotFoundEntry {
+    pub path: String,
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRouteManifest {
+    pub routes: Vec<AppRouteEntry>,
+    pub layouts: Vec<LayoutEntry>,
+    pub loading: Vec<LoadingEntry>,
+    pub errors: Vec<ErrorEntry>,
+    #[serde(rename = "notFound")]
+    pub not_found: Vec<NotFoundEntry>,
+    pub generated: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppRouteMatch {
+    pub route: AppRouteEntry,
+    pub params: FxHashMap<String, ParamValue>,
+    pub layouts: Vec<LayoutEntry>,
+    pub loading: Option<LoadingEntry>,
+    pub error: Option<ErrorEntry>,
+    pub not_found: Option<NotFoundEntry>,
+    pub pathname: String,
+}
+
+pub struct AppRouter {
+    manifest: Arc<AppRouteManifest>,
+}
+
+impl AppRouter {
+    pub fn new(manifest: AppRouteManifest) -> Self {
+        Self { manifest: Arc::new(manifest) }
+    }
+
+    pub async fn from_file(path: &str) -> Result<Self, RariError> {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| RariError::io(format!("Failed to read manifest: {e}")))?;
+
+        let manifest: AppRouteManifest = serde_json::from_str(&content)
+            .map_err(|e| RariError::configuration(format!("Failed to parse manifest: {e}")))?;
+
+        Ok(Self::new(manifest))
+    }
+
+    pub fn match_route(&self, path: &str) -> Result<AppRouteMatch, RariError> {
+        let _route_span = tracing::info_span!("route.match", route.path = %path, route.matched = tracing::field::Empty).entered();
+        let normalized_path = Self::normalize_path(path);
+
+        for route in &self.manifest.routes {
+            if let Some(params) = self.match_route_pattern(route, &normalized_path) {
+                let layouts = self.resolve_layouts(&route.path);
+
+                let loading = self.find_loading(&route.path);
+
+                let error = self.find_error(&route.path);
+
+                tracing::Span::current().record("route.matched", "true");
+                return Ok(AppRouteMatch {
+                    route: route.clone(),
+                    params,
+                    layouts,
+                    loading,
+                    error,
+                    not_found: None,
+                    pathname: normalized_path,
+                });
+            }
+        }
+
+        tracing::Span::current().record("route.matched", "false");
+        Err(RariError::not_found(format!("No route found for path: {}", path)))
+    }
+
+    pub fn create_not_found_match(&self, path: &str) -> Option<AppRouteMatch> {
+        let normalized_path = Self::normalize_path(path);
+
+        let not_found_entry = self.find_not_found("/")?;
+
+        let layouts = self.resolve_layouts("/");
+        let loading = self.find_loading("/");
+        let error = self.find_error("/");
+
+        let not_found_route = AppRouteEntry {
+            path: normalized_path.clone(),
+            file_path: not_found_entry.file_path.clone(),
+            segments: vec![],
+            params: vec![],
+            is_dynamic: false,
+            static_params: None,
+        };
+
+        Some(AppRouteMatch {
+            route: not_found_route,
+            params: FxHashMap::default(),
+            layouts,
+            loading,
+            error,
+            not_found: Some(not_found_entry),
+            pathname: normalized_path,
+        })
+    }
+
+    fn match_route_pattern(
+        &self,
+        route: &AppRouteEntry,
+        path: &str,
+    ) -> Option<FxHashMap<String, ParamValue>> {
+        let route_segments = route.path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
+        let path_segments = parse_decoded_path_segments(path);
+
+        let mut params = FxHashMap::default();
+        let mut route_idx = 0;
+        let mut path_idx = 0;
+
+        while route_idx < route_segments.len() {
+            let route_seg = route_segments[route_idx];
+
+            if route_seg.starts_with("[[...") && route_seg.ends_with("]]") {
+                let param_name = &route_seg[5..route_seg.len() - 2];
+
+                if path_idx < path_segments.len() {
+                    let remaining: Vec<String> = path_segments[path_idx..].to_vec();
+                    params.insert(param_name.to_string(), ParamValue::Multiple(remaining));
+                }
+
+                return Some(params);
+            }
+
+            if route_seg.starts_with("[...") && route_seg.ends_with(']') {
+                let param_name = &route_seg[4..route_seg.len() - 1];
+
+                if path_idx >= path_segments.len() {
+                    return None;
+                }
+
+                let remaining: Vec<String> = path_segments[path_idx..].to_vec();
+                params.insert(param_name.to_string(), ParamValue::Multiple(remaining));
+
+                return Some(params);
+            }
+
+            if route_seg.starts_with('[') && route_seg.ends_with(']') {
+                if path_idx >= path_segments.len() {
+                    return None;
+                }
+
+                let param_name = &route_seg[1..route_seg.len() - 1];
+                params.insert(
+                    param_name.to_string(),
+                    ParamValue::Single(path_segments[path_idx].clone()),
+                );
+
+                path_idx += 1;
+                route_idx += 1;
+                continue;
+            }
+
+            if path_idx >= path_segments.len() || route_seg != path_segments[path_idx] {
+                return None;
+            }
+
+            path_idx += 1;
+            route_idx += 1;
+        }
+
+        if path_idx == path_segments.len() { Some(params) } else { None }
+    }
+
+    pub fn resolve_layouts(&self, route_path: &str) -> Vec<LayoutEntry> {
+        let mut layouts = Vec::new();
+        let segments: Vec<&str> = route_path.split('/').filter(|s| !s.is_empty()).collect();
+
+        for i in 0..=segments.len() {
+            let current_path =
+                if i == 0 { "/".to_string() } else { format!("/{}", segments[..i].join("/")) };
+
+            if let Some(layout) = self.manifest.layouts.iter().find(|l| l.path == current_path) {
+                let mut layout_entry = layout.clone();
+                layout_entry.is_root = layout_entry.path == "/";
+                layouts.push(layout_entry);
+            }
+        }
+
+        layouts
+    }
+
+    fn find_loading(&self, route_path: &str) -> Option<LoadingEntry> {
+        let segments: Vec<&str> = route_path.split('/').filter(|s| !s.is_empty()).collect();
+
+        for i in (0..=segments.len()).rev() {
+            let current_path =
+                if i == 0 { "/".to_string() } else { format!("/{}", segments[..i].join("/")) };
+
+            if let Some(loading) = self.manifest.loading.iter().find(|l| l.path == current_path) {
+                return Some(loading.clone());
+            }
+        }
+
+        None
+    }
+
+    fn find_error(&self, route_path: &str) -> Option<ErrorEntry> {
+        let segments: Vec<&str> = route_path.split('/').filter(|s| !s.is_empty()).collect();
+
+        for i in (0..=segments.len()).rev() {
+            let current_path =
+                if i == 0 { "/".to_string() } else { format!("/{}", segments[..i].join("/")) };
+
+            if let Some(error) = self.manifest.errors.iter().find(|e| e.path == current_path) {
+                return Some(error.clone());
+            }
+        }
+
+        None
+    }
+
+    pub fn find_not_found(&self, route_path: &str) -> Option<NotFoundEntry> {
+        let segments: Vec<&str> = route_path.split('/').filter(|s| !s.is_empty()).collect();
+
+        for i in (0..=segments.len()).rev() {
+            let current_path =
+                if i == 0 { "/".to_string() } else { format!("/{}", segments[..i].join("/")) };
+
+            if let Some(not_found) = self.manifest.not_found.iter().find(|n| n.path == current_path)
+            {
+                return Some(not_found.clone());
+            }
+        }
+
+        None
+    }
+
+    fn normalize_path(path: &str) -> String {
+        let path = path.trim();
+
+        let path = path.split('?').next().unwrap_or(path);
+        let path = path.split('#').next().unwrap_or(path);
+
+        if path.is_empty() || !path.starts_with('/') {
+            format!("/{}", path)
+        } else {
+            path.to_string()
+        }
+    }
+
+    pub fn manifest(&self) -> &AppRouteManifest {
+        &self.manifest
+    }
+
+    pub fn warmup_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+
+        for route in &self.manifest.routes {
+            if !route.is_dynamic {
+                paths.push(route.path.clone());
+            } else if let Some(ref static_params) = route.static_params {
+                for params in static_params {
+                    let concrete_path = self.expand_route_path(&route.path, params);
+                    if let Some(p) = concrete_path {
+                        paths.push(p);
+                    }
+                }
+            }
+        }
+
+        paths
+    }
+
+    fn expand_route_path(
+        &self,
+        route_path: &str,
+        params: &FxHashMap<String, serde_json::Value>,
+    ) -> Option<String> {
+        let segments: Vec<&str> = route_path.split('/').collect();
+        let mut result_segments: Vec<String> = Vec::new();
+
+        for segment in &segments {
+            if segment.is_empty() {
+                continue;
+            }
+
+            if segment.starts_with("[[...") && segment.ends_with("]]") {
+                let param_name = &segment[5..segment.len() - 2];
+                if let Some(value) = params.get(param_name) {
+                    match value {
+                        serde_json::Value::Array(arr) => {
+                            for item in arr {
+                                if let Some(s) = item.as_str() {
+                                    result_segments.push(s.to_string());
+                                }
+                            }
+                        }
+                        serde_json::Value::String(s) => {
+                            result_segments.push(s.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            } else if segment.starts_with("[...") && segment.ends_with(']') {
+                let param_name = &segment[4..segment.len() - 1];
+                let value = params.get(param_name)?;
+                match value {
+                    serde_json::Value::Array(arr) => {
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                result_segments.push(s.to_string());
+                            }
+                        }
+                    }
+                    serde_json::Value::String(s) => {
+                        result_segments.push(s.clone());
+                    }
+                    _ => return None,
+                }
+            } else if segment.starts_with('[') && segment.ends_with(']') {
+                let param_name = &segment[1..segment.len() - 1];
+                let value = params.get(param_name)?;
+                match value {
+                    serde_json::Value::String(s) => {
+                        result_segments.push(s.clone());
+                    }
+                    _ => return None,
+                }
+            } else {
+                result_segments.push(segment.to_string());
+            }
+        }
+
+        if result_segments.is_empty() {
+            Some("/".to_string())
+        } else {
+            Some(format!("/{}", result_segments.join("/")))
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    fn create_test_manifest() -> AppRouteManifest {
+        AppRouteManifest {
+            routes: vec![
+                AppRouteEntry {
+                    path: "/".to_string(),
+                    file_path: "page.tsx".to_string(),
+                    segments: vec![],
+                    params: vec![],
+                    is_dynamic: false,
+                    static_params: None,
+                },
+                AppRouteEntry {
+                    path: "/about".to_string(),
+                    file_path: "about/page.tsx".to_string(),
+                    segments: vec![RouteSegment {
+                        segment_type: RouteSegmentType::Static,
+                        value: "about".to_string(),
+                        param: None,
+                    }],
+                    params: vec![],
+                    is_dynamic: false,
+                    static_params: None,
+                },
+                AppRouteEntry {
+                    path: "/blog/[slug]".to_string(),
+                    file_path: "blog/[slug]/page.tsx".to_string(),
+                    segments: vec![
+                        RouteSegment {
+                            segment_type: RouteSegmentType::Static,
+                            value: "blog".to_string(),
+                            param: None,
+                        },
+                        RouteSegment {
+                            segment_type: RouteSegmentType::Dynamic,
+                            value: "[slug]".to_string(),
+                            param: Some("slug".to_string()),
+                        },
+                    ],
+                    params: vec!["slug".to_string()],
+                    is_dynamic: true,
+                    static_params: None,
+                },
+                AppRouteEntry {
+                    path: "/docs/[...slug]".to_string(),
+                    file_path: "docs/[...slug]/page.tsx".to_string(),
+                    segments: vec![
+                        RouteSegment {
+                            segment_type: RouteSegmentType::Static,
+                            value: "docs".to_string(),
+                            param: None,
+                        },
+                        RouteSegment {
+                            segment_type: RouteSegmentType::CatchAll,
+                            value: "[...slug]".to_string(),
+                            param: Some("slug".to_string()),
+                        },
+                    ],
+                    params: vec!["slug".to_string()],
+                    is_dynamic: true,
+                    static_params: None,
+                },
+            ],
+            layouts: vec![
+                LayoutEntry {
+                    path: "/".to_string(),
+                    file_path: "layout.tsx".to_string(),
+                    parent_path: None,
+                    is_root: false,
+                },
+                LayoutEntry {
+                    path: "/blog".to_string(),
+                    file_path: "blog/layout.tsx".to_string(),
+                    parent_path: Some("/".to_string()),
+                    is_root: false,
+                },
+            ],
+            loading: vec![],
+            errors: vec![],
+            not_found: vec![],
+            generated: "2025-09-30T00:00:00.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_match_static_route() {
+        let router = AppRouter::new(create_test_manifest());
+        let result = router.match_route("/about");
+
+        assert!(result.is_ok());
+        let matched = result.unwrap();
+        assert_eq!(matched.route.path, "/about");
+        assert!(matched.params.is_empty());
+    }
+
+    #[test]
+    fn test_match_dynamic_route() {
+        let router = AppRouter::new(create_test_manifest());
+        let result = router.match_route("/blog/hello-world");
+
+        assert!(result.is_ok());
+        let matched = result.unwrap();
+        assert_eq!(matched.route.path, "/blog/[slug]");
+        assert_eq!(
+            matched.params.get("slug").and_then(|p| p.as_string()),
+            Some(&"hello-world".to_string())
+        );
+    }
+
+    #[test]
+    fn test_match_catch_all_route() {
+        let router = AppRouter::new(create_test_manifest());
+        let result = router.match_route("/docs/getting-started/installation");
+
+        assert!(result.is_ok());
+        let matched = result.unwrap();
+        assert_eq!(matched.route.path, "/docs/[...slug]");
+        let slug_vec = matched.params.get("slug").and_then(|p| p.as_vec());
+        assert_eq!(
+            slug_vec,
+            Some(&vec!["getting-started".to_string(), "installation".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_resolve_layouts() {
+        let router = AppRouter::new(create_test_manifest());
+        let layouts = router.resolve_layouts("/blog/[slug]");
+
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].path, "/");
+        assert_eq!(layouts[1].path, "/blog");
+    }
+
+    #[test]
+    fn test_root_layout_detection() {
+        let router = AppRouter::new(create_test_manifest());
+        let layouts = router.resolve_layouts("/blog/[slug]");
+
+        assert_eq!(layouts.len(), 2);
+        assert!(layouts[0].is_root, "Root layout (/) should have is_root = true");
+        assert_eq!(layouts[0].path, "/");
+        assert!(!layouts[1].is_root, "Nested layout (/blog) should have is_root = false");
+        assert_eq!(layouts[1].path, "/blog");
+    }
+
+    #[test]
+    fn test_root_layout_only() {
+        let router = AppRouter::new(create_test_manifest());
+        let layouts = router.resolve_layouts("/");
+
+        assert_eq!(layouts.len(), 1);
+        assert!(layouts[0].is_root, "Root layout should have is_root = true");
+        assert_eq!(layouts[0].path, "/");
+    }
+
+    #[test]
+    fn test_not_found() {
+        let router = AppRouter::new(create_test_manifest());
+        let result = router.match_route("/nonexistent");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_match_root_route() {
+        let router = AppRouter::new(create_test_manifest());
+        let result = router.match_route("/");
+
+        assert!(result.is_ok(), "Root path '/' should match");
+        let matched = result.unwrap();
+        assert_eq!(matched.route.path, "/");
+        assert_eq!(matched.route.file_path, "page.tsx");
+        assert!(matched.params.is_empty());
+    }
+
+    #[test]
+    fn test_root_route_with_dynamic_sibling() {
+        let manifest = AppRouteManifest {
+            routes: vec![
+                AppRouteEntry {
+                    path: "/".to_string(),
+                    file_path: "page.tsx".to_string(),
+                    segments: vec![],
+                    params: vec![],
+                    is_dynamic: false,
+                    static_params: None,
+                },
+                AppRouteEntry {
+                    path: "/[slug]".to_string(),
+                    file_path: "[slug]/page.tsx".to_string(),
+                    segments: vec![RouteSegment {
+                        segment_type: RouteSegmentType::Dynamic,
+                        value: "[slug]".to_string(),
+                        param: Some("slug".to_string()),
+                    }],
+                    params: vec!["slug".to_string()],
+                    is_dynamic: true,
+                    static_params: None,
+                },
+            ],
+            layouts: vec![],
+            loading: vec![],
+            errors: vec![],
+            not_found: vec![],
+            generated: "2025-01-10T00:00:00.000Z".to_string(),
+        };
+
+        let router = AppRouter::new(manifest);
+
+        let result = router.match_route("/");
+        assert!(result.is_ok(), "Root path '/' should match");
+        let matched = result.unwrap();
+        assert_eq!(matched.route.path, "/", "Should match root route, not [slug]");
+
+        let result = router.match_route("/about");
+        assert!(result.is_ok());
+        let matched = result.unwrap();
+        assert_eq!(matched.route.path, "/[slug]");
+        assert_eq!(
+            matched.params.get("slug").and_then(|p| p.as_string()),
+            Some(&"about".to_string())
+        );
+    }
+}

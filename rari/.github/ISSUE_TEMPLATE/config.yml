@@ -1,0 +1,20 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📚 Documentation
+    url: https://github.com/rari-build/rari/blob/main/README.md
+    about: Check out the comprehensive documentation and examples
+  - name: 💬 GitHub Discussions
+    url: https://github.com/rari-build/rari/discussions
+    about: Ask questions and discuss ideas with the community
+  - name: 🚀 Examples
+    url: https://github.com/rari-build/rari/tree/main/examples
+    about: Browse working examples and sample applications
+  - name: 🔧 Contributing Guide
+    url: https://github.com/rari-build/rari/blob/main/.github/CONTRIBUTING.md
+    about: Learn how to contribute to the project
+  - name: 💡 Feature Discussions
+    url: https://github.com/rari-build/rari/discussions/categories/ideas
+    about: Discuss new features and improvements with the community
+  - name: 🆘 Quick Start
+    url: https://github.com/rari-build/rari/blob/main/README.md#quick-start
+    about: Get started with rari in seconds using create-rari-app

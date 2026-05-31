@@ -1,0 +1,926 @@
+use crate::error::RariError;
+use crate::rsc::rendering::core::RscRenderer;
+use crate::rsc::utils::dependency_utils::extract_dependencies;
+use crate::server::utils::component_utils::{
+    has_use_client_directive, has_use_server_directive, wrap_server_action_module,
+};
+use crate::utils::path_url::path_to_file_url;
+use cow_utils::CowUtils;
+use tracing::error;
+
+const DIST_DIR: &str = "dist";
+
+pub struct ComponentLoader;
+
+impl ComponentLoader {
+    pub async fn load_production_components(renderer: &mut RscRenderer) -> Result<(), RariError> {
+        let manifest_path = std::path::Path::new("dist/server/manifest.json");
+        if !manifest_path.exists() {
+            return Ok(());
+        }
+
+        let manifest = Self::read_manifest(manifest_path)?;
+        let components = Self::parse_manifest_components(&manifest)?;
+
+        let mut sorted_components: Vec<_> = components.iter().collect();
+        sorted_components.sort_by_key(|(id, _)| if id.starts_with("components/") { 0 } else { 1 });
+
+        for (component_id, component_info) in sorted_components {
+            if component_id == "proxy" || component_id.ends_with("/proxy") {
+                continue;
+            }
+
+            let module_specifier = component_info.get("moduleSpecifier").and_then(|s| s.as_str());
+
+            let bundle_path =
+                component_info.get("bundlePath").and_then(|p| p.as_str()).ok_or_else(|| {
+                    RariError::configuration(format!("Component {component_id} missing bundlePath"))
+                })?;
+
+            let component_file = std::path::Path::new(DIST_DIR).join(bundle_path);
+            if !component_file.exists() {
+                error!("Component file not found: {}", component_file.display());
+                continue;
+            }
+
+            let component_code = std::fs::read_to_string(&component_file)
+                .map_err(|_e| RariError::io("Failed to read component file".to_string()))?;
+
+            let is_server_action = has_use_server_directive(&component_code);
+
+            if let Some(specifier) = module_specifier {
+                if let Err(e) = renderer
+                    .runtime
+                    .add_module_to_loader_only(specifier, component_code.clone())
+                    .await
+                {
+                    error!("Failed to add component {} to module loader: {}", component_id, e);
+                    continue;
+                }
+
+                match renderer.runtime.load_es_module(component_id).await {
+                    Ok(module_id) => {
+                        if let Err(e) = renderer.runtime.evaluate_module(module_id).await {
+                            error!(
+                                "Failed to evaluate module {} (id: {}): {}",
+                                component_id, module_id, e
+                            );
+                            continue;
+                        }
+
+                        match renderer.runtime.get_module_namespace(module_id).await {
+                            Ok(_namespace) => {
+                                let specifier_json = serde_json::to_string(specifier)
+                                    .unwrap_or_else(|e| {
+                                        error!(
+                                            "Failed to serialize module specifier for {}: {}",
+                                            component_id, e
+                                        );
+                                        "\"\"".to_string()
+                                    });
+                                let component_id_json = serde_json::to_string(component_id)
+                                    .unwrap_or_else(|e| {
+                                        error!(
+                                            "Failed to serialize component_id {}: {}",
+                                            component_id, e
+                                        );
+                                        "\"\"".to_string()
+                                    });
+
+                                if is_server_action {
+                                    let action_registration_script = format!(
+                                        r#"(async function() {{
+                                            try {{
+                                                const moduleNamespace = await import({});
+                                                if (!globalThis['~serverFunctions']) {{
+                                                    globalThis['~serverFunctions'] = {{}};
+                                                }}
+                                                if (!globalThis['~serverFunctions'].all) {{
+                                                    globalThis['~serverFunctions'].all = {{}};
+                                                }}
+                                                if (!globalThis['~serverFunctions'].exported) {{
+                                                    globalThis['~serverFunctions'].exported = {{}};
+                                                }}
+                                                for (const [key, value] of Object.entries(moduleNamespace)) {{
+                                                    if (typeof value === 'function') {{
+                                                        const moduleKey = {} + ':' + key;
+                                                        globalThis['~serverFunctions'].all[moduleKey] = value;
+                                                        globalThis['~serverFunctions'].exported[moduleKey] = value;
+                                                    }}
+                                                }}
+                                                return {{ success: true }};
+                                            }} catch (error) {{
+                                                console.error("Failed to register server action " + {}, error);
+                                                return {{ success: false, error: error.message }};
+                                            }}
+                                        }})()"#,
+                                        specifier_json, component_id_json, component_id_json
+                                    );
+
+                                    match renderer
+                                        .runtime
+                                        .execute_script(
+                                            format!(
+                                                "register_action_{}.js",
+                                                component_id.cow_replace('/', "_")
+                                            ),
+                                            action_registration_script,
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            if let Some(success) =
+                                                result.get("success").and_then(|v| v.as_bool())
+                                                && !success
+                                            {
+                                                error!(
+                                                    "Failed to register server action {}: {:?}",
+                                                    component_id,
+                                                    result.get("error")
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to register server action {}: {}",
+                                                component_id, e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !is_server_action {
+                                    let skip_global_binding = component_id.starts_with("lib/");
+                                    let registration_script = format!(
+                                        r#"globalThis['~rari'].componentLoader.registerComponent({}, {}, {})"#,
+                                        specifier_json, component_id_json, skip_global_binding
+                                    );
+
+                                    match renderer
+                                        .runtime
+                                        .execute_script(
+                                            format!(
+                                                "register_{}.js",
+                                                component_id.cow_replace('/', "_")
+                                            ),
+                                            registration_script,
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            if let Some(success) =
+                                                result.get("success").and_then(|v| v.as_bool())
+                                                && !success
+                                            {
+                                                error!(
+                                                    "Failed to register component {} to globalThis: {:?}",
+                                                    component_id,
+                                                    result.get("error")
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to register component {} to globalThis: {}",
+                                                component_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to get module namespace for {}: {}",
+                                    component_id, e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to load component {} as ESM module: {}", component_id, e);
+                    }
+                }
+            } else {
+                error!("Component {} missing moduleSpecifier in manifest.", component_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn load_server_actions_from_source(
+        renderer: &mut RscRenderer,
+    ) -> Result<(), RariError> {
+        let src_dir = std::path::Path::new("src");
+        if !src_dir.exists() {
+            return Ok(());
+        }
+
+        Self::scan_for_server_actions(src_dir, renderer).await?;
+
+        Ok(())
+    }
+
+    fn scan_for_server_actions<'a>(
+        dir: &'a std::path::Path,
+        renderer: &'a mut RscRenderer,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RariError>> + 'a>> {
+        Box::pin(async move {
+            let entries = std::fs::read_dir(dir).map_err(|e| {
+                RariError::io(format!("Failed to read directory {}: {}", dir.display(), e))
+            })?;
+
+            for entry in entries {
+                let entry = entry
+                    .map_err(|e| RariError::io(format!("Failed to read directory entry: {e}")))?;
+                let path = entry.path();
+
+                if path.is_dir() {
+                    Self::scan_for_server_actions(&path, renderer).await?;
+                } else if path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s == "ts" || s == "tsx" || s == "js" || s == "jsx")
+                    .unwrap_or(false)
+                {
+                    let code = match std::fs::read_to_string(&path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+
+                    if has_use_server_directive(&code) {
+                        let src_dir = std::path::Path::new("src");
+                        let relative_path = path.strip_prefix(src_dir).unwrap_or(&path);
+                        let action_id = relative_path
+                            .to_str()
+                            .unwrap_or("unknown")
+                            .cow_replace(".ts", "")
+                            .cow_replace(".tsx", "")
+                            .cow_replace(".js", "")
+                            .cow_replace(".jsx", "")
+                            .cow_replace('\\', "/")
+                            .into_owned();
+
+                        let dist_path = std::path::Path::new("dist")
+                            .join("server")
+                            .join(format!("{}.js", action_id));
+
+                        if dist_path.exists() {
+                            match std::fs::read_to_string(&dist_path) {
+                                Ok(dist_code) => {
+                                    let canonical_path =
+                                        dist_path.canonicalize().unwrap_or(dist_path.clone());
+                                    let module_specifier = path_to_file_url(&canonical_path);
+
+                                    let esm_load_result = renderer
+                                        .runtime
+                                        .add_module_to_loader_only(
+                                            &module_specifier,
+                                            dist_code.clone(),
+                                        )
+                                        .await;
+
+                                    if esm_load_result.is_ok() {
+                                        match renderer.runtime.load_es_module(&action_id).await {
+                                            Ok(module_id) => {
+                                                if let Err(e) = renderer
+                                                    .runtime
+                                                    .evaluate_module(module_id)
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "Failed to evaluate server action module {}: {}",
+                                                        action_id, e
+                                                    );
+                                                } else {
+                                                    let module_specifier_json = serde_json::to_string(&module_specifier)
+                                                        .map_err(|e| {
+                                                            error!("Failed to serialize module_specifier for {}: {}", action_id, e);
+                                                            RariError::internal(format!("Failed to serialize module_specifier: {}", e))
+                                                        })?;
+                                                    let action_id_json = serde_json::to_string(
+                                                        &action_id,
+                                                    )
+                                                    .map_err(|e| {
+                                                        error!(
+                                                            "Failed to serialize action_id {}: {}",
+                                                            action_id, e
+                                                        );
+                                                        RariError::internal(format!(
+                                                            "Failed to serialize action_id: {}",
+                                                            e
+                                                        ))
+                                                    })?;
+
+                                                    let registration_script = format!(
+                                                        r#"(async function() {{
+                                                            try {{
+                                                                const moduleNamespace = await import({});
+                                                                if (!globalThis['~serverFunctions']) {{
+                                                                    globalThis['~serverFunctions'] = {{}};
+                                                                }}
+                                                                if (!globalThis['~serverFunctions'].all) {{
+                                                                    globalThis['~serverFunctions'].all = {{}};
+                                                                }}
+                                                                if (!globalThis['~serverFunctions'].exported) {{
+                                                                    globalThis['~serverFunctions'].exported = {{}};
+                                                                }}
+                                                                for (const [key, value] of Object.entries(moduleNamespace)) {{
+                                                                    if (typeof value === 'function') {{
+                                                                        const moduleKey = {} + ':' + key;
+                                                                        globalThis['~serverFunctions'].all[moduleKey] = value;
+                                                                        globalThis['~serverFunctions'].exported[moduleKey] = value;
+                                                                    }}
+                                                                }}
+                                                                return {{ success: true }};
+                                                            }} catch (error) {{
+                                                                console.error("Failed to register server action " + {}, error);
+                                                                return {{ success: false, error: error.message }};
+                                                            }}
+                                                        }})()"#,
+                                                        module_specifier_json,
+                                                        action_id_json,
+                                                        action_id_json
+                                                    );
+
+                                                    match renderer
+                                                        .runtime
+                                                        .execute_script(
+                                                            format!(
+                                                                "register_action_{}.js",
+                                                                action_id.cow_replace('/', "_")
+                                                            ),
+                                                            registration_script,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(result) => {
+                                                            if let Some(success) = result
+                                                                .get("success")
+                                                                .and_then(|v| v.as_bool())
+                                                                && !success
+                                                            {
+                                                                if let Some(error_msg) = result
+                                                                    .get("error")
+                                                                    .and_then(|v| v.as_str())
+                                                                {
+                                                                    error!(
+                                                                        "Failed to register server action {}: {}",
+                                                                        action_id, error_msg
+                                                                    );
+                                                                } else {
+                                                                    error!(
+                                                                        "Failed to register server action {}: unknown error",
+                                                                        action_id
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "Failed to register server action {}: {}",
+                                                                action_id, e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to load server action {} as ESM module: {}",
+                                                    action_id, e
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        let wrapped_code =
+                                            wrap_server_action_module(&dist_code, &action_id);
+                                        match renderer
+                                            .runtime
+                                            .execute_script(
+                                                format!(
+                                                    "load_action_{}.js",
+                                                    action_id.cow_replace('/', "_")
+                                                ),
+                                                wrapped_code,
+                                            )
+                                            .await
+                                        {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to load server action {}: {}",
+                                                    action_id, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to read built server action {:?}: {}",
+                                        dist_path, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    pub async fn load_app_router_components(renderer: &mut RscRenderer) -> Result<(), RariError> {
+        let server_dir = std::path::Path::new(DIST_DIR).join("server");
+        if !server_dir.exists() {
+            return Ok(());
+        }
+
+        Self::load_server_components_recursive(&server_dir, &server_dir, renderer).await?;
+
+        Ok(())
+    }
+
+    fn load_server_components_recursive<'a>(
+        dir: &'a std::path::Path,
+        base_dir: &'a std::path::Path,
+        renderer: &'a mut RscRenderer,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RariError>> + 'a>> {
+        Box::pin(async move {
+            let entries = std::fs::read_dir(dir).map_err(|e| {
+                RariError::io(format!("Failed to read directory {}: {}", dir.display(), e))
+            })?;
+
+            for entry in entries {
+                let entry = entry
+                    .map_err(|e| RariError::io(format!("Failed to read directory entry: {e}")))?;
+                let path = entry.path();
+
+                if path.is_dir() {
+                    Self::load_server_components_recursive(&path, base_dir, renderer).await?;
+                } else if path.extension().and_then(|s| s.to_str()) == Some("js") {
+                    let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if file_name == "proxy" {
+                        continue;
+                    }
+
+                    let component_code = std::fs::read_to_string(&path).map_err(|e| {
+                        RariError::io(format!("Failed to read component file: {e}"))
+                    })?;
+
+                    if has_use_server_directive(&component_code) {
+                        let relative_path = path.strip_prefix(base_dir).unwrap_or(&path);
+                        let relative_str = relative_path
+                            .to_str()
+                            .unwrap_or("unknown")
+                            .cow_replace(".js", "")
+                            .cow_replace('\\', "/")
+                            .into_owned();
+
+                        let canonical_path = path.canonicalize().unwrap_or(path.to_path_buf());
+                        let module_specifier = path_to_file_url(&canonical_path);
+
+                        let esm_load_result = renderer
+                            .runtime
+                            .add_module_to_loader_only(&module_specifier, component_code.clone())
+                            .await;
+
+                        if esm_load_result.is_ok() {
+                            match renderer.runtime.load_es_module(&relative_str).await {
+                                Ok(module_id) => {
+                                    if let Err(e) =
+                                        renderer.runtime.evaluate_module(module_id).await
+                                    {
+                                        error!(
+                                            "Failed to evaluate server action module {}: {}",
+                                            relative_str, e
+                                        );
+                                    } else {
+                                        let module_specifier_json = serde_json::to_string(
+                                            &module_specifier,
+                                        )
+                                        .map_err(|e| {
+                                            error!(
+                                                "Failed to serialize module_specifier for {}: {}",
+                                                relative_str, e
+                                            );
+                                            RariError::internal(format!(
+                                                "Failed to serialize module_specifier: {}",
+                                                e
+                                            ))
+                                        })?;
+                                        let relative_str_json =
+                                            serde_json::to_string(&relative_str).map_err(|e| {
+                                                error!(
+                                                    "Failed to serialize relative_str {}: {}",
+                                                    relative_str, e
+                                                );
+                                                RariError::internal(format!(
+                                                    "Failed to serialize relative_str: {}",
+                                                    e
+                                                ))
+                                            })?;
+
+                                        let registration_script = format!(
+                                            r#"(async function() {{
+                                                try {{
+                                                    const moduleNamespace = await import({});
+                                                    if (!globalThis['~serverFunctions']) {{
+                                                        globalThis['~serverFunctions'] = {{}};
+                                                    }}
+                                                    if (!globalThis['~serverFunctions'].all) {{
+                                                        globalThis['~serverFunctions'].all = {{}};
+                                                    }}
+                                                    if (!globalThis['~serverFunctions'].exported) {{
+                                                        globalThis['~serverFunctions'].exported = {{}};
+                                                    }}
+                                                    for (const [key, value] of Object.entries(moduleNamespace)) {{
+                                                        if (typeof value === 'function') {{
+                                                            const moduleKey = {} + ':' + key;
+                                                            globalThis['~serverFunctions'].all[moduleKey] = value;
+                                                            globalThis['~serverFunctions'].exported[moduleKey] = value;
+                                                        }}
+                                                    }}
+                                                    return {{ success: true }};
+                                                }} catch (error) {{
+                                                    console.error("Failed to register server action " + {}, error);
+                                                    return {{ success: false, error: error.message }};
+                                                }}
+                                            }})()"#,
+                                            module_specifier_json,
+                                            relative_str_json,
+                                            relative_str_json
+                                        );
+
+                                        match renderer
+                                            .runtime
+                                            .execute_script(
+                                                format!(
+                                                    "register_{}.js",
+                                                    relative_str.cow_replace('/', "_")
+                                                ),
+                                                registration_script,
+                                            )
+                                            .await
+                                        {
+                                            Ok(result) => {
+                                                if let Some(success) =
+                                                    result.get("success").and_then(|v| v.as_bool())
+                                                    && !success
+                                                {
+                                                    if let Some(error_msg) =
+                                                        result.get("error").and_then(|v| v.as_str())
+                                                    {
+                                                        error!(
+                                                            "Failed to register server functions from {}: {}",
+                                                            relative_str, error_msg
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "Failed to register server functions from {}: unknown error",
+                                                            relative_str
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to register server functions from {}: {}",
+                                                    relative_str, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to load server action {} as ESM module: {}",
+                                        relative_str, e
+                                    );
+                                }
+                            }
+                        } else {
+                            let wrapped_code =
+                                wrap_server_action_module(&component_code, &relative_str);
+                            match renderer
+                                .runtime
+                                .execute_script(
+                                    format!("load_{}.js", relative_str.cow_replace('/', "_")),
+                                    wrapped_code,
+                                )
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!(
+                                        "Failed to load server actions from {}: {}",
+                                        relative_str, e
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    let relative_path = path.strip_prefix(base_dir).unwrap_or(&path);
+                    let relative_str = relative_path
+                        .to_str()
+                        .unwrap_or("unknown")
+                        .cow_replace(".js", "")
+                        .cow_replace('\\', "/")
+                        .into_owned();
+
+                    let component_id = relative_str.clone();
+
+                    let is_client_component = has_use_client_directive(&component_code);
+
+                    let transformed_module_code = component_code.clone();
+
+                    let dependencies = extract_dependencies(&component_code);
+
+                    {
+                        let mut registry = renderer.component_registry.lock();
+                        let _ = registry.register_component(
+                            &component_id,
+                            &component_code,
+                            transformed_module_code.clone(),
+                            dependencies.clone().into_iter().collect(),
+                        );
+                    }
+
+                    let canonical_path = path.canonicalize().unwrap_or(path.to_path_buf());
+                    let module_specifier = path_to_file_url(&canonical_path);
+
+                    let esm_load_result = renderer
+                        .runtime
+                        .add_module_to_loader_only(&module_specifier, component_code.clone())
+                        .await;
+
+                    if esm_load_result.is_ok() {
+                        match renderer.runtime.load_es_module(&component_id).await {
+                            Ok(module_id) => {
+                                if let Err(e) = renderer.runtime.evaluate_module(module_id).await {
+                                    error!(
+                                        "Failed to evaluate ESM module {} (id: {}): {}",
+                                        component_id, module_id, e
+                                    );
+                                } else {
+                                    let skip_global_binding = component_id.starts_with("lib/");
+                                    let module_specifier_json =
+                                        serde_json::to_string(&module_specifier).map_err(|e| {
+                                            error!(
+                                                "Failed to serialize module_specifier for {}: {}",
+                                                component_id, e
+                                            );
+                                            RariError::internal(format!(
+                                                "Failed to serialize module_specifier: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    let component_id_json = serde_json::to_string(&component_id)
+                                        .map_err(|e| {
+                                            error!(
+                                                "Failed to serialize component_id {}: {}",
+                                                component_id, e
+                                            );
+                                            RariError::internal(format!(
+                                                "Failed to serialize component_id: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    let registration_script = format!(
+                                        r#"globalThis['~rari'].componentLoader.registerComponent({}, {}, {})"#,
+                                        module_specifier_json,
+                                        component_id_json,
+                                        skip_global_binding
+                                    );
+
+                                    match renderer
+                                        .runtime
+                                        .execute_script(
+                                            format!(
+                                                "register_{}.js",
+                                                component_id.cow_replace('/', "_")
+                                            ),
+                                            registration_script,
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            let registration_succeeded = result
+                                                .get("success")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+
+                                            if !registration_succeeded {
+                                                error!(
+                                                    "Failed to register component {} to globalThis: {:?}",
+                                                    component_id,
+                                                    result.get("error")
+                                                );
+                                            }
+
+                                            if registration_succeeded && is_client_component {
+                                                let component_id_json = serde_json::to_string(
+                                                    &component_id,
+                                                )
+                                                .unwrap_or_else(|e| {
+                                                    error!(
+                                                        "Failed to serialize component_id {}: {}",
+                                                        component_id, e
+                                                    );
+                                                    "\"\"".to_string()
+                                                });
+                                                let mark_client_script = if skip_global_binding {
+                                                    format!(
+                                                        r#"(function() {{
+                                                            const module = globalThis['~rsc']?.modules?.[{}];
+                                                            if (module) {{
+                                                                const comp = module.default || Object.values(module).find(v => typeof v === 'function');
+                                                                if (comp && typeof comp === 'function') {{
+                                                                    comp['~isClientComponent'] = true;
+                                                                    comp['~clientComponentId'] = {};
+                                                                }}
+                                                            }}
+                                                            return {{ componentId: {}, isClient: true }};
+                                                        }})()"#,
+                                                        component_id_json,
+                                                        component_id_json,
+                                                        component_id_json
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        r#"(function() {{
+                                                            const comp = globalThis[{}];
+                                                            if (comp && typeof comp === 'function') {{
+                                                                comp['~isClientComponent'] = true;
+                                                                comp['~clientComponentId'] = {};
+                                                            }}
+                                                            return {{ componentId: {}, isClient: true }};
+                                                        }})()"#,
+                                                        component_id_json,
+                                                        component_id_json,
+                                                        component_id_json
+                                                    )
+                                                };
+
+                                                if let Err(e) = renderer
+                                                    .runtime
+                                                    .execute_script(
+                                                        format!(
+                                                            "mark_client_{}.js",
+                                                            component_id.cow_replace('/', "_")
+                                                        ),
+                                                        mark_client_script,
+                                                    )
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "Failed to mark component {} as client: {}",
+                                                        component_id, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to register component {}: {}",
+                                                component_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to load component {} as ESM module: {}",
+                                    component_id, e
+                                );
+                            }
+                        }
+                    } else {
+                        match renderer
+                            .runtime
+                            .execute_script(
+                                format!("load_{}.js", component_id.cow_replace('/', "_")),
+                                transformed_module_code,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                if is_client_component {
+                                    let skip_global_binding = component_id.starts_with("lib/");
+                                    let component_id_json = serde_json::to_string(&component_id)
+                                        .unwrap_or_else(|e| {
+                                            error!(
+                                                "Failed to serialize component_id {}: {}",
+                                                component_id, e
+                                            );
+                                            "\"\"".to_string()
+                                        });
+
+                                    let mark_client_script = if skip_global_binding {
+                                        format!(
+                                            r#"(function() {{
+                                                const module = globalThis['~rsc']?.modules?.[{}];
+                                                if (module) {{
+                                                    const comp = module.default || Object.values(module).find(v => typeof v === 'function');
+                                                    if (comp && typeof comp === 'function') {{
+                                                        comp['~isClientComponent'] = true;
+                                                        comp['~clientComponentId'] = {};
+                                                    }}
+                                                }}
+                                                return {{ componentId: {}, isClient: true }};
+                                            }})()"#,
+                                            component_id_json, component_id_json, component_id_json
+                                        )
+                                    } else {
+                                        format!(
+                                            r#"(function() {{
+                                                const comp = globalThis[{}];
+                                                if (comp && typeof comp === 'function') {{
+                                                    comp['~isClientComponent'] = true;
+                                                    comp['~clientComponentId'] = {};
+                                                }}
+                                                return {{ componentId: {}, isClient: true }};
+                                            }})()"#,
+                                            component_id_json, component_id_json, component_id_json
+                                        )
+                                    };
+
+                                    if let Err(e) = renderer
+                                        .runtime
+                                        .execute_script(
+                                            format!(
+                                                "mark_client_{}.js",
+                                                component_id.cow_replace('/', "_")
+                                            ),
+                                            mark_client_script,
+                                        )
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to mark component {} as client: {}",
+                                            component_id, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to execute component {}: {}", component_id, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn read_manifest(manifest_path: &std::path::Path) -> Result<serde_json::Value, RariError> {
+        let manifest_content = std::fs::read_to_string(manifest_path)
+            .map_err(|e| RariError::io(format!("Failed to read server manifest: {e}")))?;
+
+        serde_json::from_str(&manifest_content)
+            .map_err(|e| RariError::configuration(format!("Failed to parse server manifest: {e}")))
+    }
+
+    fn parse_manifest_components(
+        manifest: &serde_json::Value,
+    ) -> Result<&serde_json::Map<String, serde_json::Value>, RariError> {
+        manifest.get("components").and_then(|c| c.as_object()).ok_or_else(|| {
+            RariError::configuration("Invalid manifest: missing components".to_string())
+        })
+    }
+
+    pub async fn load_component_from_manifest(
+        component_id: &str,
+        component_info: &serde_json::Value,
+        renderer: &mut RscRenderer,
+    ) -> Result<(), RariError> {
+        let bundle_path =
+            component_info.get("bundlePath").and_then(|p| p.as_str()).ok_or_else(|| {
+                RariError::configuration(format!("Component {component_id} missing bundlePath"))
+            })?;
+
+        let component_file = std::path::Path::new(DIST_DIR).join(bundle_path);
+
+        if !component_file.exists() {
+            return Err(RariError::not_found(format!(
+                "Component file not found: {}",
+                component_file.display()
+            )));
+        }
+
+        let component_code = std::fs::read_to_string(&component_file)
+            .map_err(|e| RariError::io(format!("Failed to read component file: {e}")))?;
+
+        renderer
+            .register_component(component_id, &component_code)
+            .await
+            .map_err(|e| RariError::internal(format!("Failed to register component: {e}")))
+    }
+}

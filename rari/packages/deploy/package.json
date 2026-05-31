@@ -1,0 +1,35 @@
+{
+  "name": "@rari/deploy",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deployment utilities for rari CLI tools",
+  "author": "Ryan Skinner",
+  "license": "MIT",
+  "homepage": "https://github.com/rari-build/rari#readme",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./railway": {
+      "types": "./dist/railway.d.mts",
+      "import": "./dist/railway.mjs"
+    },
+    "./render": {
+      "types": "./dist/render.d.mts",
+      "import": "./dist/render.mjs"
+    }
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "devDependencies": {
+    "@rari/logger": "workspace:*",
+    "@types/node": "catalog:typescript",
+    "vite-plus": "catalog:build"
+  }
+}

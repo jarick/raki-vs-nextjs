@@ -1,0 +1,11 @@
+# Exclude large irrelevant directories from the Next.js fork
+node_modules/
+.next/
+**/target/
+.git/
+test/
+examples/
+docs/
+bench/
+playwright-report/
+test-results/

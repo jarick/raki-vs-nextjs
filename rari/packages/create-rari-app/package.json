@@ -1,0 +1,58 @@
+{
+  "name": "create-rari-app",
+  "type": "module",
+  "version": "0.5.10",
+  "description": "Create Runtime Accelerated Rendering Infrastructure (rari) applications with no build configuration",
+  "author": "Ryan Skinner",
+  "license": "MIT",
+  "homepage": "https://github.com/rari-build/rari#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rari-build/rari.git",
+    "directory": "packages/create-rari-app"
+  },
+  "bugs": {
+    "url": "https://github.com/rari-build/rari/issues"
+  },
+  "keywords": [
+    "rari",
+    "react",
+    "scaffolding",
+    "cli",
+    "create-app",
+    "generator",
+    "boilerplate",
+    "template",
+    "server-components",
+    "rust",
+    "framework",
+    "zero-config",
+    "starter",
+    "project-template"
+  ],
+  "bin": {
+    "create-rari-app": "dist/index.mjs"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist",
+    "templates"
+  ],
+  "scripts": {
+    "build": "pnpm clean && pnpm typecheck && vp pack",
+    "dev": "vp pack --watch",
+    "clean": "rm -rf dist",
+    "lint": "vp lint",
+    "lint:fix": "vp lint --fix",
+    "typecheck": "tsgo"
+  },
+  "dependencies": {
+    "@clack/prompts": "catalog:cli"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:typescript",
+    "@typescript/native-preview": "catalog:typescript",
+    "vite-plus": "catalog:build"
+  }
+}

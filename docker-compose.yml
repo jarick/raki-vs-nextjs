@@ -1,0 +1,41 @@
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  rari-app:
+    build:
+      context: .
+      dockerfile: rari/Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=rari-app
+      - SELF_URL=http://127.0.0.1:3000
+    depends_on:
+      - jaeger
+
+  next-app:
+    build:
+      context: .
+      dockerfile: nextjs/Dockerfile
+    ports:
+      - "3002:3000"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=next-app
+      - SELF_URL=http://127.0.0.1:3000
+    depends_on:
+      - jaeger
+
+  wrk:
+    build:
+      context: ./wrk
+    depends_on:
+      - rari-app
+      - next-app
+    command: ["./run-benchmark.sh"]

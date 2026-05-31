@@ -1,0 +1,492 @@
+// oxlint-disable no-unused-expressions
+/* eslint-disable no-undef, style/object-curly-spacing */
+const LOADING_PATH_REGEX = /\/[^/]+$/
+
+if (!globalThis['~render'])
+  globalThis['~render'] = {}
+
+function registerBoundary(id, fallback, parentId) {
+  if (!globalThis['~suspense'])
+    globalThis['~suspense'] = {}
+  if (!globalThis['~suspense'].discoveredBoundaries)
+    globalThis['~suspense'].discoveredBoundaries = []
+  if (globalThis['~suspense'].discoveredBoundaries.some(b => b.id === id))
+    return
+  globalThis['~suspense'].discoveredBoundaries.push({
+    id,
+    fallback,
+    parentId,
+  })
+}
+
+globalThis['~render'].componentAsync = async function () {
+  try {
+    let Component = (globalThis['~rsc']?.modules && globalThis['~rsc'].modules['{component_id}']?.default)
+      || globalThis['{component_id}']
+      || (globalThis['~rsc']?.modules && globalThis['~rsc'].modules['{component_id}'])
+
+    if (Component && typeof Component === 'object' && typeof Component.default === 'function')
+      Component = Component.default
+
+    if (!Component || typeof Component !== 'function')
+      throw new Error('Component {component_id} not found or not a function')
+
+    const props = {props_json}
+    if (!globalThis['~suspense'])
+      globalThis['~suspense'] = {}
+    if (!globalThis['~suspense'].boundaryProps)
+      globalThis['~suspense'].boundaryProps = {}
+    globalThis['~suspense'].boundaryProps.root = props
+
+    let element
+    let renderError = null
+
+    try {
+      const isOverrideActive = React.createElement.toString().includes('SUSPENSE BOUNDARY FOUND')
+
+      if (!isOverrideActive) {
+        if (!globalThis['~react'])
+          globalThis['~react'] = {}
+        if (!globalThis['~react'].originalCreateElement)
+          globalThis['~react'].originalCreateElement = React.createElement
+
+        React.createElement = function (type, props, ...children) {
+          const isSuspenseComponent = (type) => {
+            if (typeof React !== 'undefined' && React.Suspense && type === React.Suspense)
+              return true
+            if (typeof type === 'function' && type.name === 'Suspense')
+              return true
+
+            return false
+          }
+
+          if (isSuspenseComponent(type)) {
+            const boundaryId = props?.['~boundaryId'] || props?.boundaryId || props?.key || `boundary_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+            if (!globalThis['~suspense'])
+              globalThis['~suspense'] = {}
+            const previousBoundaryId = globalThis['~suspense'].currentBoundaryId
+            globalThis['~suspense'].currentBoundaryId = boundaryId
+
+            const safeFallback = props?.fallback || null
+
+            registerBoundary(boundaryId, safeFallback, previousBoundaryId)
+
+            globalThis['~suspense'].currentBoundaryId = previousBoundaryId
+            return globalThis['~react'].originalCreateElement('suspense', { ...props, 'key': boundaryId, boundaryId, '~boundaryId': boundaryId }, ...children)
+          }
+
+          return globalThis['~react'].originalCreateElement(type, props, ...children)
+        }
+      }
+
+      const isAsyncFunction = Component.constructor.name === 'AsyncFunction'
+        || Component[Symbol.toStringTag] === 'AsyncFunction'
+        || (Component.toString && Component.toString().trim().startsWith('async'))
+
+      if (isAsyncFunction) {
+        const boundaryId = globalThis['~suspense']?.currentBoundaryId || 'root_boundary'
+        const promiseId = `promise_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+
+        let loadingComponent = null
+        const componentPath = '{component_id}'
+
+        const loadingPaths = [
+          componentPath.replace(LOADING_PATH_REGEX, '/loading'),
+          `${componentPath}-loading`,
+          'app/loading',
+        ]
+
+        for (const loadingPath of loadingPaths) {
+          if (globalThis['~rsc'].modules && globalThis['~rsc'].modules[loadingPath]) {
+            const LoadingModule = globalThis['~rsc'].modules[loadingPath]
+            const LoadingComp = LoadingModule.default || LoadingModule
+            if (typeof LoadingComp === 'function') {
+              try {
+                loadingComponent = LoadingComp({})
+                break
+              }
+              catch {
+              }
+            }
+          }
+        }
+
+        let fallbackContent
+        if (loadingComponent) {
+          if (
+            typeof loadingComponent === 'object'
+            && (loadingComponent.type || loadingComponent.$$typeof)
+          ) {
+            fallbackContent = loadingComponent
+          }
+          else {
+            fallbackContent = globalThis['~react'].originalCreateElement('div', {
+              className: 'rari-loading',
+              children: 'Loading...',
+            })
+          }
+        }
+        else {
+          fallbackContent = globalThis['~react'].originalCreateElement('div', {
+            className: 'rari-loading',
+            children: 'Loading...',
+          })
+        }
+
+        registerBoundary(boundaryId, fallbackContent, null)
+
+        if (!globalThis['~suspense'].pendingPromises)
+          globalThis['~suspense'].pendingPromises = []
+        globalThis['~suspense'].pendingPromises.push({
+          id: promiseId,
+          boundaryId,
+          componentPath: '{component_id}',
+          componentType: Component,
+          componentProps: props,
+        })
+
+        const serializedFallback = globalThis['~suspense'].safeSerializeElement(fallbackContent)
+
+        const safeBoundaries = (globalThis['~suspense'].discoveredBoundaries || []).map(boundary => ({
+          id: boundary.id,
+          fallback: globalThis['~suspense'].safeSerializeElement(boundary.fallback),
+          parentId: boundary.parentId,
+        }))
+
+        const fallbackRsc = ['$', 'react.suspense', null, {
+          '~boundaryId': boundaryId,
+          'fallback': ['$', serializedFallback.type, serializedFallback.key, serializedFallback.props],
+          'children': null,
+        }]
+
+        const initialResult = {
+          success: true,
+          rsc_data: fallbackRsc,
+          boundaries: safeBoundaries,
+          pending_promises: globalThis['~suspense'].pendingPromises || [],
+          has_suspense: true,
+          error: null,
+          error_stack: null,
+        }
+
+        try {
+          const jsonString = JSON.stringify(initialResult)
+          globalThis['~render'].streamingResult = JSON.parse(jsonString)
+        }
+        catch {
+          globalThis['~render'].streamingResult = initialResult
+        }
+        globalThis['~render'].initialComplete = true
+
+        return
+      }
+
+      element = Component(props)
+
+      if (element && typeof element.then === 'function') {
+        const parentBoundaryId = globalThis['~suspense']?.currentBoundaryId || null
+        const boundaryId = parentBoundaryId || 'root_boundary'
+        const promiseId = `promise_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+
+        globalThis['~suspense'].promises = globalThis['~suspense'].promises || {}
+        globalThis['~suspense'].promises[promiseId] = element
+
+        globalThis['~suspense'].pendingPromises = globalThis['~suspense'].pendingPromises || []
+        globalThis['~suspense'].pendingPromises.push({
+          id: promiseId,
+          boundaryId,
+          componentPath: '{component_id}',
+          componentType: Component,
+          componentProps: props,
+        })
+
+        let loadingComponent = null
+        const componentPath = '{component_id}'
+
+        const loadingPaths = [
+          componentPath.replace('/page', '/loading'),
+          componentPath.replace(LOADING_PATH_REGEX, '/loading'),
+          `${componentPath}-loading`,
+          'app/loading',
+        ]
+
+        for (const loadingPath of loadingPaths) {
+          if (globalThis['~rsc'].modules && globalThis['~rsc'].modules[loadingPath]) {
+            const LoadingModule = globalThis['~rsc'].modules[loadingPath]
+            const LoadingComp = LoadingModule.default || LoadingModule
+            if (typeof LoadingComp === 'function') {
+              try {
+                loadingComponent = LoadingComp({})
+                break
+              }
+              catch {
+              }
+            }
+          }
+        }
+
+        let fallbackContent
+        if (
+          loadingComponent
+          && typeof loadingComponent === 'object'
+          && (loadingComponent.type || loadingComponent.$$typeof)
+        ) {
+          fallbackContent = loadingComponent
+        }
+        else {
+          fallbackContent = globalThis['~react'].originalCreateElement('div', {
+            className: 'rari-loading',
+            children: 'Loading...',
+          })
+        }
+
+        if (!parentBoundaryId)
+          registerBoundary(boundaryId, fallbackContent, null)
+
+        element = fallbackContent
+
+        const safeBoundaries = (globalThis['~suspense'].discoveredBoundaries || []).map(boundary => ({
+          id: boundary.id,
+          fallback: globalThis['~suspense'].safeSerializeElement(boundary.fallback),
+          parentId: boundary.parentId,
+        }))
+
+        const serializedFallback = globalThis['~suspense'].safeSerializeElement(fallbackContent)
+        const simpleFallbackRsc = {
+          type: 'react.suspense',
+          key: null,
+          props: {
+            '~boundaryId': boundaryId,
+            'fallback': {
+              type: serializedFallback.type,
+              key: serializedFallback.key,
+              props: serializedFallback.props,
+            },
+            'children': null,
+          },
+        }
+
+        const initialResult = {
+          success: true,
+          rsc_data: simpleFallbackRsc,
+          boundaries: safeBoundaries,
+          pending_promises: globalThis['~suspense'].pendingPromises || [],
+          has_suspense: true,
+          error: null,
+          error_stack: null,
+        }
+
+        try {
+          const jsonString = JSON.stringify(initialResult)
+          globalThis['~render'].streamingResult = JSON.parse(jsonString)
+        }
+        catch {
+          globalThis['~render'].streamingResult = initialResult
+        }
+        globalThis['~render'].initialComplete = true
+
+        return
+      }
+
+      const processSuspenseInStructure = (el, parentBoundaryId = null) => {
+        if (Array.isArray(el))
+          return el.map(child => processSuspenseInStructure(child, parentBoundaryId))
+
+        if (!el || typeof el !== 'object')
+          return el
+
+        const actualChildren = el.children ?? el.props?.children
+        const childArray = actualChildren == null
+          ? []
+          : Array.isArray(actualChildren) ? actualChildren : [actualChildren]
+
+        if ((el.type === 'suspense' || !el.type) && el.props && el.props.fallback && childArray.length > 0) {
+          const boundaryId = el.props['~boundaryId'] || el.props.boundaryId || el.key || el.props.key || `boundary_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+          if (!globalThis['~suspense'])
+            globalThis['~suspense'] = {}
+          const previousBoundaryId = globalThis['~suspense'].currentBoundaryId
+          globalThis['~suspense'].currentBoundaryId = boundaryId
+
+          const safeFallback = el.props.fallback || null
+
+          registerBoundary(boundaryId, safeFallback, previousBoundaryId)
+
+          const processedChildren = childArray.map((child) => {
+            try {
+              if (child && typeof child === 'object' && child.type && typeof child.type === 'function') {
+                const result = child.type(child.props || null)
+                if (result && typeof result.then === 'function') {
+                  const promiseId = `promise_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+                  globalThis['~suspense'].promises = globalThis['~suspense'].promises || {}
+                  globalThis['~suspense'].promises[promiseId] = result
+
+                  globalThis['~suspense'].pendingPromises = globalThis['~suspense'].pendingPromises || []
+                  globalThis['~suspense'].pendingPromises.push({
+                    id: promiseId,
+                    boundaryId,
+                    componentPath: (child.type.name || 'AnonymousComponent'),
+                    componentType: child.type,
+                    componentProps: child.props || {},
+                  })
+                  return safeFallback
+                }
+                else {
+                  return processSuspenseInStructure(result, boundaryId)
+                }
+              }
+            }
+            catch (error) {
+              if (error && typeof error.then === 'function') {
+                const promiseId = `promise_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+                globalThis['~suspense'].promises = globalThis['~suspense'].promises || {}
+                globalThis['~suspense'].promises[promiseId] = error
+
+                globalThis['~suspense'].pendingPromises = globalThis['~suspense'].pendingPromises || []
+                globalThis['~suspense'].pendingPromises.push({
+                  id: promiseId,
+                  boundaryId,
+                  componentPath: 'ThrownPromise',
+                  componentType: child.type,
+                  componentProps: child.props || {},
+                })
+                return safeFallback
+              }
+
+              return safeFallback
+            }
+
+            return processSuspenseInStructure(child, boundaryId)
+          })
+
+          globalThis['~suspense'].currentBoundaryId = previousBoundaryId
+
+          return {
+            type: 'suspense',
+            props: { ...el.props, 'key': boundaryId, boundaryId, '~boundaryId': boundaryId },
+            children: Array.isArray(actualChildren) ? processedChildren : processedChildren[0],
+          }
+        }
+
+        if (childArray.length > 0) {
+          const processedChildren = childArray.map(child => processSuspenseInStructure(child, parentBoundaryId))
+          return {
+            ...el,
+            children: Array.isArray(actualChildren) ? processedChildren : processedChildren[0],
+          }
+        }
+
+        return el
+      }
+
+      element = processSuspenseInStructure(element)
+    }
+    catch (suspenseError) {
+      if (suspenseError && suspenseError.$$typeof === Symbol.for('react.suspense.pending')) {
+        const componentName = suspenseError.componentName || suspenseError.name || suspenseError.message || '{component_id}'
+        const asyncDetected = suspenseError.asyncComponentDetected === true
+        const hasPromise = suspenseError.promise && typeof suspenseError.promise.then === 'function'
+
+        const isParentComponent = componentName === '{component_id}'
+          || componentName.includes('Test')
+          || componentName.includes('Streaming')
+
+        const isLeafAsyncComponent = asyncDetected
+          || (hasPromise && !isParentComponent)
+          || (componentName.includes('Async') && !isParentComponent)
+
+        if (isLeafAsyncComponent) {
+          const promiseId = `promise_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+          globalThis['~suspense'].promises = globalThis['~suspense'].promises || {}
+          globalThis['~suspense'].pendingPromises = globalThis['~suspense'].pendingPromises || []
+          globalThis['~suspense'].promises[promiseId] = suspenseError.promise
+
+          const boundaryId = globalThis['~suspense'].currentBoundaryId || 'root_boundary'
+          globalThis['~suspense'].pendingPromises.push({
+            id: promiseId,
+            boundaryId,
+            componentPath: componentName,
+            componentType: Component,
+            componentProps: props,
+          })
+        }
+
+        element = globalThis['~react'].originalCreateElement
+          ? globalThis['~react'].originalCreateElement('div', null, '')
+          : { type: 'div', props: { children: '' } }
+      }
+      else {
+        console.error('Non-suspense error during rendering:', suspenseError)
+        renderError = suspenseError
+        element = globalThis['~react'].originalCreateElement
+          ? globalThis['~react'].originalCreateElement('div', null, `Error: ${suspenseError.message}`)
+          : { type: 'div', props: { children: `Error: ${suspenseError.message}` } }
+      }
+    }
+
+    let rscData
+    try {
+      const currentBoundaryId = globalThis['~suspense']?.currentBoundaryId || null
+      rscData = globalThis.renderToRsc
+        ? await globalThis.renderToRsc(element, globalThis['~clientComponents'] || {}, currentBoundaryId)
+        : element
+    }
+    catch (rscError) {
+      console.error('Error in RSC conversion:', rscError)
+      rscData = {
+        type: 'div',
+        props: {
+          children: renderError ? `Render Error: ${renderError.message}` : 'RSC Conversion Error',
+        },
+      }
+    }
+
+    const safeBoundaries = (globalThis['~suspense'].discoveredBoundaries || []).map(boundary => ({
+      id: boundary.id,
+      fallback: globalThis['~suspense'].safeSerializeElement(boundary.fallback),
+      parentId: boundary.parentId,
+    }))
+
+    const finalResult = {
+      success: !renderError,
+      rsc_data: rscData,
+      boundaries: safeBoundaries,
+      pending_promises: globalThis['~suspense'].pendingPromises || [],
+      has_suspense: (safeBoundaries && safeBoundaries.length > 0)
+        || (globalThis['~suspense'].pendingPromises && globalThis['~suspense'].pendingPromises.length > 0),
+      error: renderError ? renderError.message : null,
+      error_stack: renderError ? renderError.stack : null,
+    }
+
+    try {
+      const jsonString = JSON.stringify(finalResult)
+      globalThis['~render'].streamingResult = JSON.parse(jsonString)
+    }
+    catch {
+      globalThis['~render'].streamingResult = finalResult
+    }
+
+    if (!globalThis['~render'].initialComplete)
+      globalThis['~render'].initialComplete = true
+
+    globalThis['~render'].streamingComplete = true
+  }
+  catch (error) {
+    console.error('Fatal error in component rendering:', error)
+    const errorResult = {
+      success: false,
+      error: error.message,
+      stack: error.stack,
+      fatal: true,
+    }
+    try {
+      const jsonString = JSON.stringify(errorResult)
+      globalThis['~render'].streamingResult = JSON.parse(jsonString)
+    }
+    catch {
+      globalThis['~render'].streamingResult = errorResult
+    }
+    globalThis['~render'].streamingComplete = true
+  }
+};
+
+({ __setup_complete: true })

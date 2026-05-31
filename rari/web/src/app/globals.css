@@ -1,0 +1,258 @@
+@import "tailwindcss";
+
+:root {
+  --rust-orange: #fd7e14;
+  --rust-orange-dark: #e8590c;
+  --github-dark-bg: #0d1117;
+  --github-dark-card: #161b22;
+  --github-dark-border: #30363d;
+  --github-text: #f0f6fc;
+  --text-secondary: #b1bac4;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background-color: var(--github-dark-bg);
+  overflow-x: hidden;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+code {
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', 'Courier New', monospace;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.prose pre {
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', 'Courier New', monospace;
+  background: var(--github-dark-bg);
+  border: 1px solid var(--github-dark-border);
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  margin: 1rem 0;
+  max-width: 100%;
+}
+
+.prose {
+  color: #c9d1d9;
+  max-width: none;
+}
+
+@media (max-width: 768px) {
+  .prose {
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+
+  .prose h1 {
+    font-size: 1.75rem;
+  }
+
+  .prose h2 {
+    font-size: 1.375rem;
+  }
+
+  .prose h3 {
+    font-size: 1.125rem;
+  }
+
+  .prose pre {
+    font-size: 0.8rem;
+    padding: 0.75rem;
+    margin: 1rem 0;
+  }
+
+  .prose table {
+    font-size: 0.8rem;
+  }
+
+  .prose th, .prose td {
+    padding: 0.5rem;
+  }
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  color: var(--github-text);
+  font-weight: 600;
+  border-bottom: 1px solid var(--github-dark-border);
+  padding-bottom: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.prose .page-header h1 {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+
+.prose h1 {
+  font-size: 2rem;
+  margin-top: 2rem;
+}
+
+.prose h2 {
+  font-size: 1.5rem;
+  margin-top: 1.5rem;
+}
+
+.prose h3 {
+  font-size: 1.25rem;
+  margin-top: 1.25rem;
+}
+
+.prose p {
+  margin-bottom: 1rem;
+  line-height: 1.6;
+}
+
+.prose ul, .prose ol {
+  margin-bottom: 1rem;
+  padding-left: 1.5rem;
+}
+
+.not-prose ol, .not-prose ul {
+  padding-left: 0;
+  margin-bottom: 0;
+  list-style: none;
+}
+
+.prose ul {
+  list-style-type: disc;
+}
+
+.prose ol {
+  list-style-type: decimal;
+}
+
+.prose li {
+  margin-bottom: 0.5rem;
+  line-height: 1.6;
+}
+
+.prose a {
+  color: var(--rust-orange);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.prose a:hover {
+  color: var(--rust-orange-dark);
+  text-decoration: underline;
+}
+
+.not-prose a,
+.not-prose a:hover {
+  text-decoration: none;
+}
+
+.prose :not(pre) > code {
+  padding: 0.125rem 0.375rem;
+  font-size: 0.875rem;
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', 'Courier New', monospace;
+  font-weight: 500;
+  border-radius: 0.375rem;
+  display: inline-block;
+  border: 1px solid var(--github-dark-border);
+  color: var(--rust-orange);
+  background-color: var(--github-dark-card);
+}
+
+.prose blockquote {
+  border-left: 4px solid var(--rust-orange);
+  background: var(--github-dark-card);
+  margin: 1rem 0;
+  padding: 1rem 1.5rem;
+  border-radius: 0 6px 6px 0;
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.prose th, .prose td {
+  border: 1px solid var(--github-dark-border);
+  padding: 0.75rem;
+  text-align: left;
+}
+
+.prose th {
+  background: var(--github-dark-card);
+  font-weight: 600;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.not-prose pre {
+  border: none;
+  margin: 0;
+  padding: 1rem;
+  background: rgb(36, 41, 46);
+  border-radius: 0;
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', 'Courier New', monospace;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--github-dark-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--github-dark-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+
+a:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--rust-orange);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--rust-orange);
+  color: white;
+}
+
+img,
+video,
+iframe {
+  max-width: 100%;
+  height: auto;
+}
+
+
+@keyframes border-trail {
+  to {
+    offset-distance: 100%;
+  }
+}
+
+.animate-border-trail {
+  animation: border-trail 3s linear infinite;
+}

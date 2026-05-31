@@ -1,0 +1,231 @@
+/* eslint-disable no-undef, style/object-curly-spacing */
+// oxlint-disable @typescript-eslint/no-floating-promises
+(async function () {
+  let Component
+  let componentSource = 'not found'
+
+  if (typeof globalThis['{component_id}'] === 'function') {
+    Component = globalThis['{component_id}']
+    componentSource = 'global.{component_id}'
+  }
+  else if (
+    globalThis['~rsc'].modules
+    && globalThis['~rsc'].modules['{component_id}']
+  ) {
+    Component
+      = globalThis['~rsc'].modules['{component_id}'].default
+        || Object.values(globalThis['~rsc'].modules['{component_id}'])[0]
+    componentSource = '~rsc.modules.{component_id}'
+  }
+  else {
+    throw new Error('Component {component_id} not found in global scope')
+  }
+
+  const sanitizeComponentOutput = (html, componentId) => {
+    if (typeof html !== 'string')
+      return html
+
+    return Deno.core.ops.op_sanitize_html(html, componentId)
+  }
+
+  const elementToRSC = (element, componentId) => {
+    try {
+      const clientComponents = globalThis['~clientComponents'] || {}
+
+      let rscResult
+      if (typeof globalThis.renderToRsc === 'function') {
+        const currentBoundaryId = globalThis['~suspense']?.currentBoundaryId || null
+        rscResult = globalThis.renderToRsc(element, clientComponents, currentBoundaryId)
+      }
+      else if (typeof globalThis.traverseToRsc === 'function') {
+        rscResult = globalThis.traverseToRsc(element, clientComponents)
+      }
+      else {
+        rscResult = {
+          $$typeof: Symbol.for('react.transitional.element'),
+          type: 'div',
+          props: {
+            'data-rsc-component': componentId,
+            'children': element,
+          },
+        }
+      }
+
+      return rscResult
+    }
+    catch (error) {
+      return {
+        $$typeof: Symbol.for('react.transitional.element'),
+        type: 'div',
+        props: {
+          'data-rsc-component': componentId,
+          'children': `Error: ${error.message}`,
+        },
+      }
+    }
+  }
+
+  const props = {props_json}
+
+  const isAsyncComponent = Component.constructor.name === 'AsyncFunction'
+
+  let element
+  if (isAsyncComponent) {
+    try {
+      const result = await Component(props)
+      element = result
+    }
+    catch (asyncError) {
+      const errorResult = {
+        html: `<div><h2>Error Rendering {component_id}</h2><p>${asyncError.message}</p></div>`,
+        rsc: null,
+        hasSuspense: false,
+        debug: {
+          component_id: componentSource,
+          success: false,
+          error: asyncError.message,
+        },
+      }
+      if (!globalThis['~render'])
+        globalThis['~render'] = {}
+      globalThis['~render'].lastResult = errorResult
+
+      return errorResult
+    }
+  }
+  else {
+    element = Component(props)
+  }
+
+  try {
+    const rscResult = elementToRSC(element, '{component_id}')
+
+    let htmlResult = null
+    try {
+      htmlResult = renderToHTML(element)
+      htmlResult = sanitizeComponentOutput(htmlResult, '{component_id}')
+    }
+    catch (htmlError) {
+      console.warn('HTML generation failed, using RSC only:', htmlError)
+      htmlResult = `<div data-rsc-component="{component_id}">RSC Component</div>`
+    }
+
+    if (!rscResult) {
+      const emptyResult = {
+        html:
+          htmlResult
+          || `<div><h2>Component: ${componentSource}</h2><p>Empty result from component rendering</p></div>`,
+        rsc: null,
+        hasSuspense: false,
+        debug: {
+          component_id: componentSource,
+          success: false,
+          reason: 'empty_rsc',
+        },
+      }
+      if (!globalThis['~render'])
+        globalThis['~render'] = {}
+      globalThis['~render'].lastResult = emptyResult
+
+      return emptyResult
+    }
+
+    const finalResult = {
+      html: htmlResult,
+      rsc: rscResult,
+      hasSuspense: false,
+      debug: {
+        component_id: componentSource,
+        success: true,
+        htmlLength: htmlResult ? htmlResult.length : 0,
+        hasRSC: !!rscResult,
+      },
+    }
+
+    if (!globalThis['~render'])
+      globalThis['~render'] = {}
+    globalThis['~render'].lastResult = finalResult
+
+    return finalResult
+  }
+  catch (error) {
+    if (error && error.$$typeof === Symbol.for('react.suspense.pending')) {
+      if (error.promise && typeof error.promise.then === 'function') {
+        try {
+          await error.promise
+
+          const newElement = isAsyncComponent ? await Component(props) : Component(props)
+
+          const rscResult = elementToRSC(newElement, '{component_id}')
+
+          let htmlResult = null
+          try {
+            htmlResult = renderToHTML(newElement)
+            htmlResult = sanitizeComponentOutput(htmlResult, '{component_id}')
+          }
+          catch (htmlError) {
+            console.warn(
+              'HTML generation failed after suspense, using RSC only:',
+              htmlError,
+            )
+            htmlResult = `<div data-rsc-component="{component_id}">RSC Component (Suspense Resolved)</div>`
+          }
+
+          const suspenseResolvedResult = {
+            html: htmlResult,
+            rsc: rscResult,
+            hasSuspense: true,
+            debug: {
+              component_id: componentSource,
+              success: true,
+              resolvedFromSuspense: true,
+              htmlLength: htmlResult ? htmlResult.length : 0,
+              hasRSC: !!rscResult,
+            },
+          }
+
+          if (!globalThis['~render'])
+            globalThis['~render'] = {}
+          globalThis['~render'].lastResult = suspenseResolvedResult
+          return suspenseResolvedResult
+        }
+        catch (resolveError) {
+          const finalError = resolveError
+
+          const errorResult = {
+            html: `<div><h2>Error Rendering {component_id}</h2><p>${finalError.message}</p></div>`,
+            rsc: null,
+            hasSuspense: false,
+            debug: {
+              component_id: componentSource,
+              success: false,
+              error: finalError.message,
+            },
+          }
+
+          if (!globalThis['~render'])
+            globalThis['~render'] = {}
+          globalThis['~render'].lastResult = errorResult
+          return errorResult
+        }
+      }
+    }
+
+    const errorResult = {
+      html: `<div><h2>Error Rendering {component_id}</h2><p>${error.message}</p></div>`,
+      rsc: null,
+      hasSuspense: false,
+      debug: {
+        component_id: componentSource,
+        success: false,
+        error: error.message,
+      },
+    }
+
+    if (!globalThis['~render'])
+      globalThis['~render'] = {}
+    globalThis['~render'].lastResult = errorResult
+
+    return errorResult
+  }
+})()

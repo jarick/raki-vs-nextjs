@@ -1,0 +1,13 @@
+{
+  "benchmark": "rari-vs-nextjs",
+  "type": "fetch-cache",
+  "message": "Mock JSON payload for fetch performance comparison",
+  "items": [
+    { "id": 1, "name": "Rari", "description": "Rust-based React framework with V8 RSC" },
+    { "id": 2, "name": "Next.js", "description": "Node.js-based React framework" }
+  ],
+  "metadata": {
+    "source": "public/data.json",
+    "strategy": "force-cache"
+  }
+}
