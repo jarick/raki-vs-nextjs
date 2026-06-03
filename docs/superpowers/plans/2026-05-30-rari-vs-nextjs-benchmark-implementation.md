@@ -2,36 +2,36 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Проверить заявления Rari о 18x ускорении относительно Next.js через OTel-инструментовку исходников и wrk-бенчмаркинг.
+**Goal:** Verify Rari's 18x performance claims against Next.js using OTel instrumentation of both frameworks' source code and wrk benchmarking.
 
-**Architecture:** Docker Compose стек из 5 сервисов: rari-app (Rust+V8+OTel), next-app (Node.js+OTel), otel-collector, jaeger, wrk. RSC тестовое дерево: Page→Header→Main→CardList→Card[x10] async components.
+**Architecture:** Docker Compose stack of 5 services: rari-app (Rust+V8+OTel), next-app (Node.js+OTel), otel-collector, jaeger, wrk. RSC test tree: Page→Header→Main→CardList→Card[x10] async components.
 
 **Tech Stack:** Rust (Rari + tracing/tracing-subscriber + opentelemetry crate), TypeScript (Next.js + @opentelemetry/api), Docker/multi-stage, wrk, Jaeger/Tempo
 
 ---
 
-### Важное замечание: OTel уже встроен в оба фреймворка
+### Important note: OTel already built into both frameworks
 
-При изучении исходников выяснилось:
+Source code analysis revealed:
 
 **Rari:**
-- `init_logging()` в `crates/rari/src/bin/rari.rs` уже поднимает OTLP экспортёр через `tracing-opentelemetry`
-- Все спаны уже расставлены: `http.request`, `route.match`, `rsc.render`, `v8.execute_script`, `rsc.serialize_json`, `rsc.serialize`
-- `deno_telemetry` extension для JS-стороны тоже встроен
-- Зависимости в `Cargo.toml` уже есть: `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `tracing-opentelemetry`
+- `init_logging()` in `crates/rari/src/bin/rari.rs` already sets up the OTLP exporter via `tracing-opentelemetry`
+- All spans are already placed: `http.request`, `route.match`, `rsc.render`, `v8.execute_script`, `rsc.serialize_json`, `rsc.serialize`
+- `deno_telemetry` extension for the JS side is also built in
+- Dependencies in `Cargo.toml` already present: `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `tracing-opentelemetry`
 
 **Next.js:**
-- `packages/next/src/server/lib/trace/tracer.ts` — полноценная обёртка над `@opentelemetry/api`
-- `packages/next/src/server/lib/trace/constants.ts` — все основные span-константы: `AppRenderSpan.rscPayload`, `AppRenderSpan.componentTree`, `BaseServerSpan.handleRequest/serialize/routeMatch` и др.
-- Спаны уже воткнуты в `app-render.tsx`, `create-component-tree.tsx`, `base-server.ts`, `render-result.ts`
-- Allowlist отфильтровывает неважные спаны — по умолчанию `componentTree`, `rscPayload`, `handleRequest`, `routeMatch`, `serialize` и др. активны
-- Экспорт OTLP настраивается через `instrumentation.ts` в проекте (Next.js не имеет встроенного экспортёра, это ответственность пользователя)
-- npm-пакет next не включает все спаны в compiled dist — поэтому Docker build собирает Next.js из source fork через pnpm
+- `packages/next/src/server/lib/trace/tracer.ts` — full wrapper over `@opentelemetry/api`
+- `packages/next/src/server/lib/trace/constants.ts` — all core span constants: `AppRenderSpan.rscPayload`, `AppRenderSpan.componentTree`, `BaseServerSpan.handleRequest/serialize/routeMatch` and more
+- Spans are already inserted in `app-render.tsx`, `create-component-tree.tsx`, `base-server.ts`, `render-result.ts`
+- Allowlist filters out unimportant spans — by default `componentTree`, `rscPayload`, `handleRequest`, `routeMatch`, `serialize` and others are active
+- OTLP export is configured via `instrumentation.ts` in the project (Next.js has no built-in exporter, it's the user's responsibility)
+- npm package next does not include all spans in compiled dist — therefore Docker build compiles Next.js from source fork via pnpm
 
-**Что всё ещё нужно сделать:**
-- Rari: проверить, что per-component спаны (`rsc.card`, `rsc.header`) создаются или доработать если нет
-- Next.js: создать `instrumentation.ts` с OTLP экспортёром (стандартный Next.js механизм)
-- Согласовать имена спанов между фреймворками для прямого сравнения
+**What still needs to be done:**
+- Rari: verify that per-component spans (`rsc.card`, `rsc.header`) are created or add them if not
+- Next.js: create `instrumentation.ts` with OTLP exporter (standard Next.js mechanism)
+- Align span names between frameworks for direct comparison
 
 ---
 
@@ -233,43 +233,43 @@ module.exports = {
 
 ### Task 2: Verify and refine Rari OTel instrumentation
 
-Rari уже имеет всю OTel-инфраструктуру. Нужно только проверить per-component spans и создать Dockerfile.
+Rari already has the full OTel infrastructure. Only need to verify per-component spans and create the Dockerfile.
 
 **Files:**
-- Read: `D:\rari\rari\crates\rari\src\rsc\rendering\core\renderer.rs` — проверить существующие спаны
-- Read: `D:\rari\rari\crates\rari\src\rsc\rendering\layout\core.rs` — проверить `v8.execute_composition` и `rsc.serialize_json`
-- Read: `D:\rari\rari\crates\rari\src\bin\rari.rs` — убедиться что `init_logging()` конфигурится через `OTEL_EXPORTER_OTLP_ENDPOINT`
-- Create: `D:\rari\rari\Dockerfile` — multi-stage сборка с Rust и runtime
+- Read: `D:\rari\rari\crates\rari\src\rsc\rendering\core\renderer.rs` — verify existing spans
+- Read: `D:\rari\rari\crates\rari\src\rsc\rendering\layout\core.rs` — verify `v8.execute_composition` and `rsc.serialize_json`
+- Read: `D:\rari\rari\crates\rari\src\bin\rari.rs` — verify that `init_logging()` is configured via `OTEL_EXPORTER_OTLP_ENDPOINT`
+- Create: `D:\rari\rari\Dockerfile` — multi-stage build with Rust and runtime
 
 - [ ] **Step 1: Verify existing spans match benchmark needs**
 
-Проверить, что существующие спаны покрывают spec:
+Verify that existing spans cover the spec:
 
-| Spec-спан | Rari-спан | Статус |
+| Spec span | Rari span | Status |
 |-----------|-----------|--------|
-| `http.accept` | — | tokio, не инструментирован явно (не нужен) |
-| `http.parse` | — | hyper, не инструментирован явно (не нужен) |
-| `route.dispatch` | `route.match` | ✅ существует |
-| `v8.isolate.init` | `v8.execute_script` / `v8.execute_function` | ✅ существует |
-| `rsc.page` | `rsc.render` с `component.type=page` | ✅ существует |
-| `rsc.header` | `rsc.render` с `component.type=header` | ⚠️ проверить, передаётся ли component.id |
-| `rsc.card_list` | `rsc.render` с `component.type=card_list` | ⚠️ проверить |
-| `rsc.card` | `rsc.render` с `component.type=card` | ⚠️ проверить |
-| `rsc.card.async` | `rsc.render` + `v8.execute_function` | ⚠️ проверить coverage |
-| `rsc.serialize` | `rsc.serialize` + `rsc.serialize_json` | ✅ существует |
-| `http.write` | — | hyper Response, не нужен отдельно |
+| `http.accept` | — | tokio, not explicitly instrumented (not needed) |
+| `http.parse` | — | hyper, not explicitly instrumented (not needed) |
+| `route.dispatch` | `route.match` | ✅ exists |
+| `v8.isolate.init` | `v8.execute_script` / `v8.execute_function` | ✅ exists |
+| `rsc.page` | `rsc.render` with `component.type=page` | ✅ exists |
+| `rsc.header` | `rsc.render` with `component.type=header` | ⚠️ check if component.id is passed |
+| `rsc.card_list` | `rsc.render` with `component.type=card_list` | ⚠️ check |
+| `rsc.card` | `rsc.render` with `component.type=card` | ⚠️ check |
+| `rsc.card.async` | `rsc.render` + `v8.execute_function` | ⚠️ check coverage |
+| `rsc.serialize` | `rsc.serialize` + `rsc.serialize_json` | ✅ exists |
+| `http.write` | — | hyper Response, not needed separately |
 
 - [ ] **Step 2: If per-component spans are insufficient, add them**
 
-Если `renderer.rs::internal_render_to_rsc()` не создаёт отдельные спаны для каждого компонента (только один общий `rsc.render`), добавить `tracing::span!()` или `tracer.start()` вокруг рендера каждого компонента. Использовать макросы `tracing` для минимального оверхеда:
+If `renderer.rs::internal_render_to_rsc()` does not create separate spans for each component (only one generic `rsc.render`), add `tracing::span!()` or `tracer.start()` around each component's render. Use `tracing` macros for minimal overhead:
 
 ```rust
-// В renderer.rs, перед рендером каждого компонента:
+// In renderer.rs, before rendering each component:
 let component_span = tracing::info_span!("rsc.render", component.type = %component_type);
 let _guard = component_span.enter();
 ```
 
-Rari уже использует `tracing` + `tracing-opentelemetry` bridge, так что `tracing::info_span!()` автоматически создаст OTel-спан.
+Rari already uses `tracing` + `tracing-opentelemetry` bridge, so `tracing::info_span!()` will automatically create an OTel span.
 
 - [ ] **Step 3: Create Rari Dockerfile**
 
@@ -300,25 +300,25 @@ ENV OTEL_SERVICE_NAME=rari
 CMD ["rari", "start", "--host", "0.0.0.0", "--port", "3000"]
 ```
 
-> Rari `init_logging()` по умолчанию шлёт на `http://otel-collector:4318` (HTTP, не gRPC) — это важно! Порт 4318, а не 4317.
+> Rari `init_logging()` sends to `http://otel-collector:4318` by default (HTTP, not gRPC) — this is important! Port 4318, not 4317.
 
 ---
 
 ### Task 3: Configure Next.js OTel export (instrumentation.ts)
 
-Next.js уже имеет встроенную OTel-инфраструктуру:
-- `tracer.ts` — `NextTracerImpl` обёртка над `@opentelemetry/api`
-- `constants.ts` — спаны: `BaseServerSpan.routeMatch/serialize`, `AppRenderSpan.componentTree/rscPayload`, `AppRenderSpan.renderToReadableStream` и др. — все в allowlist
-- Спаны уже воткнуты в `base-server.ts`, `app-render.tsx`, `render-result.ts`, `create-component-tree.tsx`
+Next.js already has built-in OTel infrastructure:
+- `tracer.ts` — `NextTracerImpl` wrapper over `@opentelemetry/api`
+- `constants.ts` — spans: `BaseServerSpan.routeMatch/serialize`, `AppRenderSpan.componentTree/rscPayload`, `AppRenderSpan.renderToReadableStream` and more — all in allowlist
+- Spans are already inserted in `base-server.ts`, `app-render.tsx`, `render-result.ts`, `create-component-tree.tsx`
 
-**Важно:** npm-пакет next не включает все эти спаны в compiled dist. Чтобы получить их, собираем Next.js из source fork (`nextjs/`) в Docker. Тогда все встроенные спаны работают без патчей.
+**Important:** npm package next does not include all these spans in compiled dist. To get them, we build Next.js from source fork (`nextjs/`) in Docker. Then all built-in spans work without patches.
 
 **Files:**
-- Create: `D:\rari\app\next-hello\instrumentation.ts` — настройка OTLP экспортёра
-- Create: `D:\rari\app\next-hello\package.json` — добавить OTel SDK пакеты
-- Create: `D:\rari\nextjs\Dockerfile` — multi-stage с pnpm build next из source
+- Create: `D:\rari\app\next-hello\instrumentation.ts` — OTLP exporter configuration
+- Create: `D:\rari\app\next-hello\package.json` — add OTel SDK packages
+- Create: `D:\rari\nextjs\Dockerfile` — multi-stage with pnpm build next from source
 
-- [ ] **Step 1: Create `instrumentation.ts` в тестовом проекте**
+- [ ] **Step 1: Create `instrumentation.ts` in the test project**
 
 ```typescript
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
@@ -337,7 +337,7 @@ export function register() {
 }
 ```
 
-- [ ] **Step 2: Добавить OTel SDK в package.json**
+- [ ] **Step 2: Add OTel SDK to package.json**
 
 ```json
 {
@@ -386,13 +386,13 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 ```
 
-> Сборка из source fork гарантирует все встроенные спаны без патчей.
+> Building from source fork guarantees all built-in spans without patches.
 
 ---
 
 ### Task 4: Docker Infrastructure / Benchmark Stack
 
-Оба приложения шлют трейсы по HTTP OTLP на `otel-collector:4318`. Collector форвардит в Jaeger по gRPC (4317).
+Both applications send traces via HTTP OTLP to `otel-collector:4318`. Collector forwards to Jaeger via gRPC (4317).
 
 **Files:**
 - Modify: `D:\rari\docker-compose.yml`

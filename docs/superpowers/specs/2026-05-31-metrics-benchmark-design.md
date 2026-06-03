@@ -1,102 +1,102 @@
-# Метрики для статьи Rari vs Next.js
+# Metrics for Rari vs Next.js article
 
-## 1. Цель
+## 1. Goal
 
-Добавить 8 метрик (P0-P3) в бенчмарк-инфраструктуру проекта для усиления аргументации в статье. Каждая метрика оценивается по сложности и полезности.
+Add 8 metrics (P0-P3) to the project's benchmark infrastructure to strengthen the article's analysis. Each metric is evaluated by complexity and value.
 
-## 2. Приоритеты
+## 2. Priorities
 
-| Priority | Метрика | Обоснование |
-|----------|---------|-------------|
-| P0 | P95/P99 latency | Бесплатно (флаг wrk), резко повышает качество |
-| P0 | Payload equivalence | Критично для валидности сравнения |
-| P1 | TTFB / time to last byte | Ключевое архитектурное различие (streaming vs buffering) |
-| P1 | Saturation curve | Лучшая визуализация деградации |
-| P2 | Cache hit ratio | Доказательство механизма 260x |
-| P2 | CPU per request | Честность сравнения |
-| P3 | Memory RSS | Стоимость хостинга |
-| P3 | Span coverage | Доверие к OTel-инструментовке |
+| Priority | Metric | Rationale |
+|----------|--------|-----------|
+| P0 | P95/P99 latency | Free (wrk flag), dramatically improves quality |
+| P0 | Payload equivalence | Critical for comparison validity |
+| P1 | TTFB / time to last byte | Key architectural difference (streaming vs buffering) |
+| P1 | Saturation curve | Best visualization of degradation |
+| P2 | Cache hit ratio | Evidence for the 260x mechanism |
+| P2 | CPU per request | Fairness of comparison |
+| P3 | Memory RSS | Hosting cost |
+| P3 | Span coverage | Trust in OTel instrumentation |
 
-## 3. Имплементация
+## 3. Implementation
 
 ### 3.1 P0: P95/P99 latency
 
-**Где**: `wrk/run-benchmark.sh`
-**Что**: Добавить флаг `--latency` к wrk вызовам
-**Сложность**: 5 минут, +2 строки
-**Результат**: wrk выдаёт распределение p50/p75/p90/p99
+**Where**: `wrk/run-benchmark.sh`
+**What**: Add `--latency` flag to wrk calls
+**Difficulty**: 5 minutes, +2 lines
+**Result**: wrk outputs p50/p75/p90/p99 distribution
 
 ### 3.2 P0: Payload equivalence
 
-**Где**: `wrk/verify-payload.js` (новый файл)
-**Что**: 
-1. curl обоих серверов, сохранение тела ответа
-2. Node.js-скрипт через React 19 Flight Client (`createFromFetch`) парсит оба RSC-потока
-3. Сравнение: количество RSC-чанков, имена компонентов, структура props
-4. Вывод: "Component tree идентичен: Page → Layout → Header, Main → CardList → Card[10]"
-**Сложность**: ~80 строк JS, полдня
+**Where**: `wrk/verify-payload.js` (new file)
+**What**: 
+1. curl both servers, save response body
+2. Node.js script using React 19 Flight Client (`createFromFetch`) parses both RSC streams
+3. Compare: RSC chunk count, component names, props structure
+4. Output: "Component tree identical: Page → Layout → Header, Main → CardList → Card[10]"
+**Difficulty**: ~80 lines JS, half a day
 
 ### 3.3 P1: TTFB / time to last byte
 
-**Где**: `wrk/run-benchmark.sh`
-**Что**: Добавить `curl --no-buffer` с `-w "%{time_starttransfer}:%{time_total}"` до/после wrk
-**Сложность**: +10 строк bash, полдня
-**Результат**: Rari TTFB ~0.3ms (из кеша), Next.js TTFB ~210ms (буферизация всего ответа)
+**Where**: `wrk/run-benchmark.sh`
+**What**: Add `curl --no-buffer` with `-w "%{time_starttransfer}:%{time_total}"` before/after wrk
+**Difficulty**: +10 lines bash, half a day
+**Result**: Rari TTFB ~0.3ms (from cache), Next.js TTFB ~210ms (full response buffering)
 
 ### 3.4 P1: Saturation curve
 
-**Где**: `wrk/saturation.sh` (новый файл)
-**Что**: Цикл wrk по concurrency: 1, 10, 25, 50, 100, 200, 500
-Каждый уровень: warmup 10s, run 30s. Парсинг req/s и latency в CSV.
-Запускается отдельно: `sh saturation.sh`
-**Сложность**: ~60 строк bash, 1-2 дня (7 уровней × 40s × 2 приложения × 3 повтора)
-**Результат**: CSV для графика "Throughput vs Concurrency"
+**Where**: `wrk/saturation.sh` (new file)
+**What**: wrk loop over concurrency: 1, 10, 25, 50, 100, 200, 500
+Each level: warmup 10s, run 30s. Parse req/s and latency into CSV.
+Run separately: `sh saturation.sh`
+**Difficulty**: ~60 lines bash, 1-2 days (7 levels × 40s × 2 apps × 3 repeats)
+**Result**: CSV for "Throughput vs Concurrency" chart
 
 ### 3.5 P2: Cache hit ratio
 
-**Где**: 
-- `rari/crates/rari/src/server/handlers/app_handler.rs` — новый route `/_cache-stats`
-- `wrk/run-benchmark.sh` — curl этого эндпоинта после теста
-**Что**: Rari уже имеет счётчики `cache_hits`/`cache_misses` в `ResponseCache` (AtomicU64). Нужно:
-1. Добавить handler для `GET /_cache-stats` → JSON `{hits, misses, evictions, hit_ratio}`
-2. Вызвать после benchmark: `curl http://rari-app:3000/_cache-stats`
-**Сложность**: +20 строк Rust, 5 строк bash, полдня
+**Where**: 
+- `rari/crates/rari/src/server/handlers/app_handler.rs` — new `/_cache-stats` route
+- `wrk/run-benchmark.sh` — curl this endpoint after the test
+**What**: Rari already has `cache_hits`/`cache_misses` counters in `ResponseCache` (AtomicU64). Need to:
+1. Add handler for `GET /_cache-stats` → JSON `{hits, misses, evictions, hit_ratio}`
+2. Call after benchmark: `curl http://rari-app:3000/_cache-stats`
+**Difficulty**: +20 lines Rust, 5 lines bash, half a day
 
 ### 3.6 P2: CPU per request
 
-**Где**: `wrk/capture-stats.sh` (новый файл)
-**Что**: Параллельный процесс `docker stats --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"` каждые 5 секунд
-**Сложность**: ~30 строк bash, полдня
-**Результат**: CPU·ms/req для каждого фреймворка
+**Where**: `wrk/capture-stats.sh` (new file)
+**What**: Parallel process: `docker stats --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"` every 5 seconds
+**Difficulty**: ~30 lines bash, half a day
+**Result**: CPU·ms/req for each framework
 
 ### 3.7 P3: Memory RSS
 
-**Где**: Часть `capture-stats.sh` + отдельные команды `docker exec`
-**Что**: 
-- `docker stats` даёт RSS live
-- Для Next.js: `process.memoryUsage()` через docker exec
-- Для Rari: `/proc/self/status` или `malloc_stats`
-**Сложность**: часть P2, дополнительно ~полдня
+**Where**: Part of `capture-stats.sh` + separate `docker exec` commands
+**What**: 
+- `docker stats` provides RSS live
+- For Next.js: `process.memoryUsage()` via docker exec
+- For Rari: `/proc/self/status` or `malloc_stats`
+**Difficulty**: Part of P2, additional ~half a day
 
 ### 3.8 P3: Span coverage
 
-**Контекст**: Ручные `opentelemetry::global::tracer().start()` в Rari заменяются на `tracing`-макросы. `tracing-opentelemetry` bridge уже настроен — tracing-спаны автоматически экспортируются как OTel.
+**Context**: Manual `opentelemetry::global::tracer().start()` calls in Rari are replaced with `tracing` macros. The `tracing-opentelemetry` bridge is already configured — tracing spans are automatically exported as OTel.
 
-Next.js уже использует встроенный `NextTracerImpl` — изменений не требует.
+Next.js already uses the built-in `NextTracerImpl` — no changes needed.
 
-**Где**: `rari/crates/rari/src/`
-**Что**:
-1. Заменить все `opentelemetry::global::tracer("rari").start("span.name")` на `tracing::info_span!("span.name")` с `.entered()`
-2. `http.request` (app_handler.rs:803): `let _span = info_span!("http.request", http.method = %method, http.path = %uri.path()).entered();` — guard auto-ends на всех return-путях
-3. `rsc.render`: переместить span из `internal_render_to_rsc` (dead code) в `render_route_with_streaming`
-4. streaming path: добавить `info_span!("rsc.streaming")` вокруг `render_partial_from_composition()`
-5. Удалить неиспользуемый raw OTel boilerplate (прямые импорты `opentelemetry::global::tracer`)
-**Сложность**: ~30 строк Rust, полдня
+**Where**: `rari/crates/rari/src/`
+**What**:
+1. Replace all `opentelemetry::global::tracer("rari").start("span.name")` with `tracing::info_span!("span.name")` + `.entered()`
+2. `http.request` (app_handler.rs:803): `let _span = info_span!("http.request", http.method = %method, http.path = %uri.path()).entered();` — guard auto-ends on all return paths
+3. `rsc.render`: move span from `internal_render_to_rsc` (dead code) to `render_route_with_streaming`
+4. streaming path: add `info_span!("rsc.streaming")` around `render_partial_from_composition()`
+5. Remove unused raw OTel boilerplate (direct imports of `opentelemetry::global::tracer`)
+**Difficulty**: ~30 lines Rust, half a day
 
-## 4. Изменения в файлах
+## 4. File Changes
 
-| Файл | Тип | Строк +/- |
-|------|-----|-----------|
+| File | Type | Lines +/- |
+|------|------|-----------|
 | `wrk/run-benchmark.sh` | edit | +15 |
 | `wrk/saturation.sh` | new | ~60 |
 | `wrk/verify-payload.js` | new | ~80 |
@@ -108,24 +108,24 @@ Next.js уже использует встроенный `NextTracerImpl` — и
 | `rari/.../serializer/mod.rs` | edit | +0 |
 | `rari/.../runtime/mod.rs` | edit | +0 |
 
-## 5. Результаты для статьи
+## 5. Article Results
 
-После имплементации статья получит:
+After implementation, the article will include:
 
-1. **Таблица латентности**: avg / p50 / p90 / p99 / max для обоих фреймворков
-2. **Payload equivalence**: подтверждение одинакового RSC-дерева
-3. **TTFB разница**: Rari <1ms (streaming) vs Next.js ≈210ms (buffered)
-4. **Saturation curve**: график req/s vs concurrency с точкой насыщения
-5. **Cache hit ratio**: доказательство 100% hit rate в Rari
-6. **CPU·ms/req**: честная efficiency
-7. **Memory RSS**: стоимость runtime
-8. **Span coverage**: полный Jaeger trace с фиксами
+1. **Latency table**: avg / p50 / p90 / p99 / max for both frameworks
+2. **Payload equivalence**: confirmation of identical RSC trees
+3. **TTFB difference**: Rari <1ms (streaming) vs Next.js ≈210ms (buffered)
+4. **Saturation curve**: req/s vs concurrency chart with saturation point
+5. **Cache hit ratio**: evidence of 100% hit rate in Rari
+6. **CPU·ms/req**: fair efficiency comparison
+7. **Memory RSS**: runtime cost
+8. **Span coverage**: full Jaeger trace with fixes
 
-## 6. Границы
+## 6. Boundaries
 
-**НЕ входит в scope:**
-- OTel overhead замер (P5 — не оправдывает сложность)
+**Out of scope:**
+- OTel overhead measurement (P5 — complexity not justified)
 - Cold start latency (P4 — nice-to-have)
-- Аллокационный профиль (heaptrack) — слишком сложно
-- CPU flamegraph — потребует `perf` на Rust, не влезает в контейнер
-- Сравнение 18x с разными RSC-деревьями
+- Allocation profile (heaptrack) — too complex
+- CPU flamegraph — requires `perf` on Rust, not container-friendly
+- 18x comparison across different RSC trees

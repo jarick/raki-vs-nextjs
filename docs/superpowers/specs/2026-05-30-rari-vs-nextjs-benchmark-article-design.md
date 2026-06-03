@@ -1,91 +1,91 @@
-# Rari vs Next.js: Бенчмаркинг и статья на Хабр
+# Rari vs Next.js: OpenTelemetry Benchmark & Article
 
-## Цель
-Проверить заявления Rari о 18x ускорении относительно Next.js с помощью OpenTelemetry инструментовки исходников обоих фреймворков и нагрузочного тестирования wrk. Написать хардкорную инженерную статью на Хабр.
+## Goal
+Verify Rari's 18x performance claims against Next.js using OpenTelemetry instrumentation of both frameworks' source code and wrk load testing. Write an in-depth engineering article.
 
-## Целевая аудитория
-Хардкорные инженеры, интересующиеся архитектурой рантаймов (Rust vs Node.js), внутренним устройством RSC, микро-бенчмаркингом.
+## Target Audience
+Hardcore engineers interested in runtime architecture (Rust vs Node.js), internal RSC implementation, and micro-benchmarking.
 
-## Структура статьи
-1. **Введение** — Rari заявляет 18x быстрее Next.js. Маркетинг или реальность?
-2. **Архитектура под микроскопом**
+## Article Structure
+1. **Introduction** — Rari claims 18x faster than Next.js. Marketing or reality?
+2. **Architecture Under the Microscope**
    - 2.1 Rari: Rust HTTP server → V8 isolate → RSC render → serialize
    - 2.2 Next.js: Node.js event loop → RSC render → serialize
-   - 2.3 Принципиальная разница: нативный код vs JIT, zero-copy vs Buffer аллокации
-3. **Методология эксперимента**
-   - 3.1 Тестовый стенд: Docker (Docker Compose стек)
-   - 3.2 RSC дерево: Page → Header → Main → CardList → Card[N] (async RSC)
-   - 3.3 OpenTelemetry: карта span-точек в обоих рантаймах
-   - 3.4 wrk: -t12 -c100 -d30s, warmup 10s + 3 runs, медиана
-4. **Инструментовка: OTel в рантаймах**
-   - 4.1 Rari: `opentelemetry` crate в Rust — точки внедрения
-   - 4.2 Next.js: `@opentelemetry/api` в Node.js — точки внедрения
-   - 4.3 Jaeger: визуализация span-таймлайнов
-5. **Результаты wrk**
+   - 2.3 Fundamental difference: native code vs JIT, zero-copy vs Buffer allocations
+3. **Methodology**
+   - 3.1 Test environment: Docker Compose stack
+   - 3.2 RSC tree: Page → Header → Main → CardList → Card[N] (async RSC)
+   - 3.3 OpenTelemetry: span point map in both runtimes
+   - 3.4 wrk: -t12 -c100 -d30s, warmup 10s + 3 runs, median
+4. **Instrumentation: OTel in Runtimes**
+   - 4.1 Rari: `opentelemetry` crate in Rust — injection points
+   - 4.2 Next.js: `@opentelemetry/api` in Node.js — injection points
+   - 4.3 Jaeger: span timeline visualization
+5. **wrk Results**
    - 5.1 Throughput (req/s)
    - 5.2 Latency (avg, p50, p95, p99)
-   - 5.3 CPU profiling (flamegraph под нагрузкой)
-6. **Анализ: где Rari реально быстрее?**
-   - 6.1 Разбор span-таймлайнов
+   - 5.3 CPU profiling (flamegraph under load)
+6. **Analysis: Where Rari Is Actually Faster**
+   - 6.1 Span timeline breakdown
    - 6.2 V8 isolate vs Node.js warmup
-   - 6.3 Serialization: zero-copy в Rust vs Buffer.toString() в Node.js
-   - 6.4 Что НЕ даёт прироста
-7. **Выводы** — вердикт для продакшна
+   - 6.3 Serialization: zero-copy in Rust vs Buffer.toString() in Node.js
+   - 6.4 Factors not contributing to performance
+7. **Conclusions** — verdict for production use
 
-## Технические решения
+## Technical Decisions
 
-### Тестовый стенд
-- Docker Compose стек:
-  - `rari-app` — собранный из исходников Rari с OTel (multi-stage Dockerfile)
-  - `next-app` — собранный из исходников Next.js с OTel (multi-stage Dockerfile)
+### Test Environment
+- Docker Compose stack:
+  - `rari-app` — Rari built from source with OTel (multi-stage Dockerfile)
+  - `next-app` — Next.js built from source with OTel (multi-stage Dockerfile)
   - `otel-collector` — OpenTelemetry Collector
-  - `jaeger` — визуализация трейсов
-  - `wrk` — контейнер с wrk для запуска тестов
+  - `jaeger` — trace visualization
+  - `wrk` — wrk container for test execution
 
-### RSC тестовое дерево
+### RSC Test Tree
 ```
 Page (async RSC)
 └── Header
 └── Main
     └── CardList
-        └── Card[N] (N=10, каждый async RSC)
+        └── Card[N] (N=10, each async RSC)
 ```
-Каждый Card содержит: заголовок + описание. Все компоненты — Server Components без `"use client"`. Асинхронность через `await` на промис.
+Each Card contains: title + description. All components are Server Components without `"use client"`. Async via `await` on a promise.
 
-### OTel span-точки
+### OTel Span Points
 
-| Этап | Rari (Rust) | Next.js (Node.js) |
-|------|-------------|-------------------|
-| Приём соединения | `http.accept` — tokio::spawn | `http.accept` — http.createServer |
-| Парсинг запроса | `http.parse` — hyper request | `http.parse` — IncomingMessage |
-| Роутинг | `route.dispatch` — match path | `route.dispatch` — Next.js router |
-| Init isolate/vm | `v8.isolate.init` | `v8.warmup` — модуль резолв |
-| Рендер Page | `rsc.page` | `rsc.page` |
-| Рендер Header | `rsc.header` | `rsc.header` |
-| Рендер CardList | `rsc.card_list` | `rsc.card_list` |
-| Рендер Card[N] | `rsc.card` (N child spans) | `rsc.card` (N child spans) |
+| Stage | Rari (Rust) | Next.js (Node.js) |
+|-------|-------------|-------------------|
+| Connection accept | `http.accept` — tokio::spawn | `http.accept` — http.createServer |
+| Request parsing | `http.parse` — hyper request | `http.parse` — IncomingMessage |
+| Routing | `route.dispatch` — match path | `route.dispatch` — Next.js router |
+| Init isolate/vm | `v8.isolate.init` | `v8.warmup` — module resolve |
+| Render Page | `rsc.page` | `rsc.page` |
+| Render Header | `rsc.header` | `rsc.header` |
+| Render CardList | `rsc.card_list` | `rsc.card_list` |
+| Render Card[N] | `rsc.card` (N child spans) | `rsc.card` (N child spans) |
 | Await async data | `rsc.card.async` | `rsc.card.async` |
-| Сериализация | `rsc.serialize` — Rust to bytes | `rsc.serialize` — JSON.stringify |
-| Отправка | `http.write` — hyper::Response | `http.write` — ServerResponse |
+| Serialization | `rsc.serialize` — Rust to bytes | `rsc.serialize` — JSON.stringify |
+| Response send | `http.write` — hyper::Response | `http.write` — ServerResponse |
 
-### wrk параметры
-- `-t12 -c100 -d30s` (многопоточный)
-- Warmup 10s + 3 runs по 30s
-- Берётся медиана по 3 runs
-- Результаты: req/s, avg latency, p50, p95, p99
+### wrk Parameters
+- `-t12 -c100 -d30s` (multi-threaded)
+- Warmup 10s + 3 runs of 30s
+- Median across 3 runs
+- Results: req/s, avg latency, p50, p95, p99
 
-### Инструментовка Rari (Rust)
-- Крейт `opentelemetry`
-- Прогрев V8 isolate: Исследовать, нужно ли держать пул изолятов или создавать на каждый запрос
-- Приоритет: zero-copy сериализация через `bytes` crate
+### Rari Instrumentation (Rust)
+- `opentelemetry` crate
+- V8 isolate warmup: investigate whether to maintain a pool of isolates or create per request
+- Priority: zero-copy serialization via `bytes` crate
 
-### Инструментовка Next.js (Node.js)
-- Пакет `@opentelemetry/api`
-- Патч роутера Next.js для замеров этапов
-- Сравнить с турбопаками
+### Next.js Instrumentation (Node.js)
+- `@opentelemetry/api` package
+- Patch Next.js router for stage measurements
+- Compare with turbopack
 
-## Критерии успеха
-1. Получены воспроизводимые цифры latency/throughput для обоих фреймворков
-2. Получены span-таймлайны, показывающие распределение времени по этапам
-3. Статья объёмом ~10 минут чтения, без воды, сфокусированная на инженерном анализе
-4. Понятно, за счёт чего именно Rari быстрее (или не быстрее) в каждом этапе
+## Success Criteria
+1. Reproducible latency/throughput figures for both frameworks
+2. Span timelines showing time distribution across stages
+3. Article ~10 minutes reading, focused on engineering analysis
+4. Clear understanding of what makes Rari faster (or not) at each stage

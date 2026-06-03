@@ -1,18 +1,18 @@
 # Rari vs Next.js Benchmark
 
-Цель: проверить заявления Rari о 18x ускорении относительно Next.js через OTel-инструментовку исходников и wrk-бенчмаркинг.
+Goal: verify Rari's 18x performance claims against Next.js through OTel instrumentation of both frameworks' source code and wrk benchmarking.
 
-## Структура проекта
-- `rari/` — fork rari-build/rari с OTel патчами
-- `nextjs/` — fork vercel/next.js с OTel патчами
-- `app/rari-hello/` — Rari тестовый проект
-- `app/next-hello/` — Next.js тестовый проект
-- `otel/` — конфиг OpenTelemetry Collector
-- `wrk/` — контейнер с wrk скриптами
-- `results/` — результаты бенчмарков
-- `docs/` — spec и plan
+## Project Structure
+- `rari/` — fork of rari-build/rari with OTel patches
+- `nextjs/` — fork of vercel/next.js with OTel patches
+- `app/rari-hello/` — Rari test project
+- `app/next-hello/` — Next.js test project
+- `otel/` — OpenTelemetry Collector config
+- `wrk/` — container with wrk scripts
+- `results/` — benchmark results
+- `docs/` — specs and plans
 
-## Как запустить
+## How to Run
 ```bash
 docker compose build
 docker compose up -d otel-collector jaeger
